@@ -1,0 +1,2 @@
+为什么用langgraph不用dify
+  因为dify没有环图且不支持并发
