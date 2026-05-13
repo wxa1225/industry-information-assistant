@@ -45,8 +45,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      milvus:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
       interval: 30s
@@ -93,62 +91,29 @@ services:
       - bupt324_network
 
   # ==================== Milvus 向量数据库 ====================
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.5
-    container_name: bupt324_etcd
-    restart: unless-stopped
-    environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-      - ETCD_SNAPSHOT_COUNT=50000
-    volumes:
-      - bupt324_etcd_data:/etcd
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - bupt324_network
-
-  minio:
-    image: minio/minio:latest
-    container_name: bupt324_minio
-    restart: unless-stopped
-    environment:
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-changeme}
-    volumes:
-      - bupt324_minio_data:/minio_data
-    command: minio server /minio_data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - bupt324_network
-
+  # v2.4.16 开始支持 ARM64 (aarch64) 架构
   milvus:
-    image: milvusdb/milvus:v2.3.3
+    image: milvusdb/milvus:v2.4.16
     container_name: bupt324_milvus
     restart: unless-stopped
-    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
     environment:
-      ETCD_ENDPOINTS: bupt324_etcd:2379
-      MINIO_ADDRESS: bupt324_minio:9000
+      ETCD_USE_EMBED: true
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      MINIO_USE_EMBED: true
+      MINIO_DATA_DIR: /var/lib/milvus/minio
     volumes:
       - bupt324_milvus_data:/var/lib/milvus
-    depends_on:
-      - etcd
-      - minio
+    ports:
+      - "19530:19530"
+      - "9091:9091"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
       timeout: 20s
       retries: 3
+      start_period: 60s
     networks:
       - bupt324_network
 
@@ -170,8 +135,6 @@ services:
 volumes:
   bupt324_postgres_data:
   bupt324_redis_data:
-  bupt324_etcd_data:
-  bupt324_minio_data:
   bupt324_milvus_data:
 
 networks:
