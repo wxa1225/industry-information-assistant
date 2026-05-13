@@ -1,25 +1,30 @@
 version: '3.8'
 
+# ============================================================
+# bupt324 专用部署配置
+# 所有容器、网络、数据卷都加前缀，不影响机器上其他人的服务
+# ============================================================
+
 services:
   # ==================== Backend API ====================
   api:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: industry_api
+    container_name: bupt324_api
     restart: unless-stopped
     environment:
-      - POSTGRES_HOST=postgres
+      - POSTGRES_HOST=bupt324_postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB:-industry_assistant}
-      - REDIS_HOST=redis
+      - REDIS_HOST=bupt324_redis
       - REDIS_PORT=6379
-      - MILVUS_HOST=milvus
+      - MILVUS_HOST=bupt324_milvus
       - MILVUS_PORT=19530
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8080}
       - AUTO_MIGRATE=false
       - DB_POOL_SIZE=10
       - DB_MAX_OVERFLOW=20
@@ -31,8 +36,6 @@ services:
       - BOCHAAI_API_KEY=${BOCHAAI_API_KEY}
       - SERPER_API_KEY=${SERPER_API_KEY}
       - TUSHARE_API_KEY=${TUSHARE_API_KEY}
-      - RAGFLOW_API_KEY=${RAGFLOW_API_KEY}
-      - RAGFLOW_BASE_URL=${RAGFLOW_BASE_URL:-http://localhost:8080}
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     ports:
@@ -51,53 +54,48 @@ services:
       retries: 3
       start_period: 15s
     networks:
-      - industry_network
+      - bupt324_network
 
   # ==================== PostgreSQL 数据库 ====================
   postgres:
     image: postgres:15-alpine
-    container_name: industry_postgres
+    container_name: bupt324_postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       POSTGRES_DB: ${POSTGRES_DB:-industry_assistant}
       TZ: Asia/Shanghai
-    ports:
-      - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker/init-db:/docker-entrypoint-initdb.d
+      - bupt324_postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - industry_network
+      - bupt324_network
 
   # ==================== Redis 缓存 ====================
   redis:
     image: redis:7-alpine
-    container_name: industry_redis
+    container_name: bupt324_redis
     restart: unless-stopped
     command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
     volumes:
-      - redis_data:/data
+      - bupt324_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - industry_network
+      - bupt324_network
 
   # ==================== Milvus 向量数据库 ====================
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
-    container_name: industry_etcd
+    container_name: bupt324_etcd
     restart: unless-stopped
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -105,7 +103,7 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - etcd_data:/etcd
+      - bupt324_etcd_data:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -113,21 +111,17 @@ services:
       timeout: 20s
       retries: 3
     networks:
-      - industry_network
+      - bupt324_network
 
   minio:
     image: minio/minio:latest
-    #image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    container_name: industry_minio
+    container_name: bupt324_minio
     restart: unless-stopped
     environment:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-changeme}
-    ports:
-      - "9001:9001"
-      - "9000:9000"
     volumes:
-      - minio_data:/minio_data
+      - bupt324_minio_data:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -135,21 +129,18 @@ services:
       timeout: 20s
       retries: 3
     networks:
-      - industry_network
+      - bupt324_network
 
   milvus:
     image: milvusdb/milvus:v2.3.3
-    container_name: industry_milvus
+    container_name: bupt324_milvus
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
-      ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
+      ETCD_ENDPOINTS: bupt324_etcd:2379
+      MINIO_ADDRESS: bupt324_minio:9000
     volumes:
-      - milvus_data:/var/lib/milvus
-    ports:
-      - "19530:19530"
-      - "9091:9091"
+      - bupt324_milvus_data:/var/lib/milvus
     depends_on:
       - etcd
       - minio
@@ -159,37 +150,30 @@ services:
       timeout: 20s
       retries: 3
     networks:
-      - industry_network
+      - bupt324_network
 
-  # ==================== Elasticsearch (可选，用于全文检索) ====================
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
-    container_name: industry_elasticsearch
+  # ==================== 前端 (React + Nginx) ====================
+  # 注意：端口用 8080，因为 3000 已被别人的 Open WebUI 占用
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bupt324_frontend
     restart: unless-stopped
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "1200:9200"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      - "8080:80"
+    depends_on:
+      - api
     networks:
-      - industry_network
+      - bupt324_network
 
 volumes:
-  postgres_data:
-  redis_data:
-  etcd_data:
-  minio_data:
-  milvus_data:
-  es_data:
+  bupt324_postgres_data:
+  bupt324_redis_data:
+  bupt324_etcd_data:
+  bupt324_minio_data:
+  bupt324_milvus_data:
 
 networks:
-  industry_network:
+  bupt324_network:
     driver: bridge

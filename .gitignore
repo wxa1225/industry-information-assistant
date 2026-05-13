@@ -83,6 +83,7 @@ alembic/versions/*_backup_*
 .env
 .env.*
 !.env.example
+!deploy.env
 
 # ruff
 .ruff_cache/
