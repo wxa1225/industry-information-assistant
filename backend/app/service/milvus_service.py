@@ -2,12 +2,10 @@
 # 未经授权，禁止转售或仿制。
 
 """Milvus 向量存储服务"""
+import logging
 import os
 from typing import List, Dict, Any, Optional
 from pymilvus import (
-import logging
-
-logger = logging.getLogger(__name__)
     connections,
     Collection,
     CollectionSchema,
@@ -15,6 +13,8 @@ logger = logging.getLogger(__name__)
     DataType,
     utility,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MilvusService:
