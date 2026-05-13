@@ -47,3 +47,50 @@ langfuse/
 .cache/
 *.cache
 USER_ACTION.md
+
+# Data and traces
+data/
+*.sqlite3
+*.db
+
+# Claude Code
+.claude/
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Pytest
+.pytest_cache/
+
+# Alembic auto-generated migrations (keep only the config)
+# Note: we DO commit migrations, but exclude auto-generated backups
+alembic/versions/*_backup_*
+
+# OS temp files
+*.tmp
+*.bak
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+
+# Environment files (root + all subdirectories)
+.env
+.env.*
+!.env.example
+
+# ruff
+.ruff_cache/
+
+# Sensitive files (explicit, even if patterns above miss them)
+backend/.env
+frontend/.env
+**/*.pem
+**/*.key
+**/*credentials*
+**/*secrets*

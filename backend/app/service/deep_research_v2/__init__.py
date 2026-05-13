@@ -14,6 +14,9 @@ DeepResearch V2.0 - 生成式多智能体协作网络
 使用方式：
 ```python
 from service.deep_research_v2 import DeepResearchService
+import logging
+
+logger = logging.getLogger(__name__)
 
 service = DeepResearchService(
     llm_api_key="your-api-key",

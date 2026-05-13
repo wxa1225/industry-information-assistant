@@ -318,12 +318,15 @@ class LeadWriter(BaseAgent):
             charts_info="\n".join(charts_info) if charts_info else "（暂无图表）"
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是顶级的行业研究分析师，擅长撰写专业的研究报告。",
             user_prompt=prompt,
             json_mode=True,
             temperature=0.4,
-            max_tokens=16000  # 拉满到最大值
+            max_tokens=16000,  # 拉满到最大值
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)
@@ -390,12 +393,15 @@ class LeadWriter(BaseAgent):
         )
 
         self.logger.info(f"[LeadWriter] 调用 LLM 整合报告...")
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是资深的研究报告主编，擅长整合和打磨最终报告。",
             user_prompt=prompt,
             json_mode=True,
             temperature=0.3,
-            max_tokens=16000  # 拉满到最大值
+            max_tokens=16000,  # 拉满到最大值
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)
@@ -459,12 +465,15 @@ class LeadWriter(BaseAgent):
             new_info=new_info if new_info else "无补充信息"
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是负责修订报告的资深编辑。",
             user_prompt=prompt,
             json_mode=True,
             temperature=0.3,
-            max_tokens=16000  # 拉满到最大值
+            max_tokens=16000,  # 拉满到最大值
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)

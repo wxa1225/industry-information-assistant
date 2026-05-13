@@ -338,11 +338,14 @@ class DataAnalyst(BaseAgent):
             search_results="\n".join(search_results_text)
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是专业的数据分析师，擅长从文本中提取结构化数据。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)
@@ -378,11 +381,14 @@ class DataAnalyst(BaseAgent):
             content="\n".join(content_parts)
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是知识图谱专家，擅长从文本中提取实体和关系。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)
@@ -425,11 +431,14 @@ class DataAnalyst(BaseAgent):
             data=str(data_for_charts)
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是数据可视化专家，擅长生成ECharts图表配置。请输出JSON格式。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.3
+            temperature=0.3,
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)
@@ -471,11 +480,14 @@ class DataAnalyst(BaseAgent):
     "summary": "一句话总结"
 }}"""
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是数据分析师，提取关键数据。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         return self.parse_json_response(response)

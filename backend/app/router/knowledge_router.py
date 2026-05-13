@@ -14,6 +14,9 @@ from models.knowledge import KnowledgeBase, Document
 from models.user import User
 from router.auth_router import get_current_user_required
 from schemas.knowledge import (
+import logging
+
+logger = logging.getLogger(__name__)
     KnowledgeBaseCreate,
     KnowledgeBaseUpdate,
     KnowledgeBaseResponse,
@@ -473,14 +476,14 @@ async def get_document_chunks(
 
     # 从 Milvus 获取切片
     collection_name = f"kb_{kb.name}".lower().replace(" ", "_")
-    print(f"[get_document_chunks] 查询切片: collection={collection_name}, filename={doc.filename}")
+    logger.debug(f"[get_document_chunks] 查询切片: collection={collection_name}, filename={doc.filename}")
 
     try:
         milvus = get_milvus_service()
         chunks = milvus.get_chunks_by_filename(collection_name, doc.filename)
-        print(f"[get_document_chunks] 找到 {len(chunks)} 个切片")
+        logger.debug(f"[get_document_chunks] 找到 {len(chunks)} 个切片")
     except Exception as e:
-        print(f"[get_document_chunks] Milvus 查询失败: {e}")
+        logger.debug(f"[get_document_chunks] Milvus 查询失败: {e}")
         # 返回空结果而不是报错
         chunks = []
 

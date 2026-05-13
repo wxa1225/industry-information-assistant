@@ -400,10 +400,13 @@ df = df.dropna()
 
         self.logger.info(f"[CodeWizard] 调用LLM生成分析代码，数据点数量: {len(state['data_points'])}")
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是专业的数据分析师，擅长Python数据处理和可视化。",
             user_prompt=prompt,
-            json_mode=True
+            json_mode=True,
+            context_layers=context_layers,
         )
 
         # ===== 详细日志: LLM原始响应 =====
@@ -619,11 +622,14 @@ df = df.dropna()
         )
 
         try:
+            # Prefix Caching 友好：使用四层上下文
+            context_layers = self.build_context_layers(state)
             response = await self.call_llm(
                 system_prompt="你是Python代码调试专家，擅长分析错误并修复代码。",
                 user_prompt=prompt,
                 json_mode=True,
-                temperature=0.2
+                temperature=0.2,
+                context_layers=context_layers,
             )
             return self.parse_json_response(response)
         except Exception as e:

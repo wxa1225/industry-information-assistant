@@ -115,6 +115,7 @@ class ResearchState(TypedDict):
     # 基础信息
     query: str                              # 用户原始问题
     session_id: str                         # 会话ID
+    trace_id: str                           # 全链路追踪ID（可观测性）
     phase: str                              # 当前阶段
     iteration: int                          # 当前迭代轮次
     max_iterations: int                     # 最大迭代次数
@@ -151,6 +152,7 @@ class ResearchState(TypedDict):
     unresolved_issues: int                  # 未解决问题数
     quality_score: float                    # 质量评分
     pending_search_queries: List[str]       # 待执行的补充搜索查询（审核后需要补充的）
+    conflict_report: Dict[str, Any]         # 交叉验证报告（冲突检测 + 验证结果 + 置信度）
 
     # 元数据
     logs: List[Dict[str, Any]]              # 执行日志
@@ -161,6 +163,7 @@ class ResearchState(TypedDict):
 def create_initial_state(
     query: str,
     session_id: str,
+    trace_id: str = "",
     search_web: bool = True,
     search_local: bool = False
 ) -> ResearchState:
@@ -169,12 +172,14 @@ def create_initial_state(
     Args:
         query: 用户查询
         session_id: 会话ID
+        trace_id: 全链路追踪ID（用于可观测性）
         search_web: 是否启用网络搜索（默认True）
         search_local: 是否启用本地知识库搜索（默认False）
     """
     return ResearchState(
         query=query,
         session_id=session_id,
+        trace_id=trace_id,
         phase=ResearchPhase.INIT.value,
         iteration=0,
         max_iterations=3,
@@ -199,6 +204,7 @@ def create_initial_state(
         unresolved_issues=0,
         quality_score=0.0,
         pending_search_queries=[],
+        conflict_report={},
         logs=[],
         errors=[],
         messages=[]

@@ -13,6 +13,9 @@ from pymilvus import (
     utility,
 )
 from service.embedding_service import generate_embedding
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class PolicySearchService:
@@ -34,9 +37,9 @@ class PolicySearchService:
                 host=self.host,
                 port=self.port,
             )
-            print(f"PolicySearchService 已连接到 Milvus: {self.host}:{self.port}")
+            logger.debug(f"PolicySearchService 已连接到 Milvus: {self.host}:{self.port}")
         except Exception as e:
-            print(f"连接 Milvus 失败: {e}")
+            logger.debug(f"连接 Milvus 失败: {e}")
 
     def _ensure_collection(self) -> Optional[Collection]:
         """确保集合存在"""
@@ -70,11 +73,11 @@ class PolicySearchService:
             collection.create_index(field_name="vector", index_params=index_params)
             collection.load()
 
-            print(f"集合 {self.collection_name} 创建成功")
+            logger.debug(f"集合 {self.collection_name} 创建成功")
             return collection
 
         except Exception as e:
-            print(f"创建集合失败: {e}")
+            logger.debug(f"创建集合失败: {e}")
             return None
 
     def check_connection(self) -> Dict[str, Any]:
@@ -260,7 +263,7 @@ class PolicySearchService:
             content = doc.get("content", "")
             vectors = generate_embedding([content])
             if not vectors:
-                print("生成向量失败")
+                logger.debug("生成向量失败")
                 return False
 
             # 插入数据
@@ -280,7 +283,7 @@ class PolicySearchService:
             return True
 
         except Exception as e:
-            print(f"插入文档失败: {e}")
+            logger.debug(f"插入文档失败: {e}")
             return False
 
 

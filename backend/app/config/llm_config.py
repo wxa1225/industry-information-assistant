@@ -87,7 +87,7 @@ class AgentsConfig:
 class ResearchConfig:
     """研究流程配置"""
     # 最大迭代次数（审核-修订循环）
-    max_iterations: int = 1
+    max_iterations: int = 3
 
     # 每个章节最大搜索数量
     max_searches_per_section: int = 3
@@ -100,6 +100,10 @@ class ResearchConfig:
 
     # 质量评分阈值（1-10分制，低于此分数需要修订）
     quality_threshold: float = 6.0
+
+    # 收敛检测阈值：连续 N 轮 quality_score 提升不超过此值，则强制结束
+    convergence_rounds: int = 2
+    convergence_threshold: float = 0.5
 
 
 @dataclass

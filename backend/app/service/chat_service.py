@@ -2,6 +2,7 @@
 # 未经授权，禁止转售或仿制。
 
 import json
+import logging
 import os
 from typing import List, Dict, Any, Optional, Generator
 import uuid
@@ -16,6 +17,8 @@ from .document_service import DocumentService
 from .web_search_service import WebSearchService
 from .session_service import SessionService
 from .memory_service import get_memory_service
+
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
@@ -78,7 +81,7 @@ class ChatService:
             
             return documents
         except Exception as e:
-            print(f"Error retrieving from knowledge base: {str(e)}")
+            logger.error(f"Error retrieving from knowledge base: {str(e)}")
             return []
     
     def retrieve_from_web(self, question: str) -> List[Dict[str, Any]]:
@@ -133,7 +136,7 @@ class ChatService:
             
             return documents
         except Exception as e:
-            print(f"Error retrieving from web: {str(e)}")
+            logger.error(f"Error retrieving from web: {str(e)}")
             return []
     
     def rerank_similarity(self, query: str, documents: List[Dict[str, Any]]) -> List[float]:
@@ -168,7 +171,7 @@ class ChatService:
             
             return scores
         except Exception as e:
-            print(f"Error in rerank_similarity: {str(e)}")
+            logger.error(f"Error in rerank_similarity: {str(e)}")
             # 出错时返回原始权重
             return [doc.get("weight", 1.0) for doc in documents]
     
@@ -202,39 +205,36 @@ class ChatService:
             # 计算token并截断，保证总token数不超过限制
             filtered_docs = []
             total_tokens = 0
-            
-            print(f"\n{'='*50}")
-            print(f"文档Token数量控制:")
-            print(f"{'='*50}")
-            
+
+            logger.debug("文档Token数量控制开始")
+
             for doc in sorted_docs:
                 # 计算此文档的token数量（内容部分）
                 doc_tokens = len(self.encoding.encode(doc["content"]))
-                
+
                 # 检查是否会超出限制
                 if total_tokens + doc_tokens > self.max_tokens:
-                    print(f"跳过文档: {doc.get('title', '无标题')} ({doc_tokens} tokens)，会超出限制")
+                    logger.debug(f"跳过文档: {doc.get('title', '无标题')} ({doc_tokens} tokens)，会超出限制")
                     continue
-                
+
                 # 加入文档并累计token数
                 filtered_docs.append(doc)
                 total_tokens += doc_tokens
-                print(f"添加文档: {doc.get('title', '无标题')} ({doc_tokens} tokens), 累计: {total_tokens}/{self.max_tokens}")
-                
+                logger.debug(f"添加文档: {doc.get('title', '无标题')} ({doc_tokens} tokens), 累计: {total_tokens}/{self.max_tokens}")
+
                 # 如果已经有10个文档，跳出循环（保持现有的文档数量限制）
                 if len(filtered_docs) >= 10:
                     break
-            
-            print(f"\n文档筛选结果: 选择了 {len(filtered_docs)}/{len(sorted_docs)} 个文档，总token数: {total_tokens}")
-            print(f"{'='*50}\n")
-            
+
+            logger.debug(f"文档筛选结果: 选择了 {len(filtered_docs)}/{len(sorted_docs)} 个文档，总token数: {total_tokens}")
+
             # 确保文档ID是连续的
             for i, doc in enumerate(filtered_docs):
                 doc["id"] = i + 1
-                
+
             return filtered_docs
         except Exception as e:
-            print(f"Error in rerank_documents: {str(e)}")
+            logger.error(f"Error in rerank_documents: {str(e)}")
             # 出错时回退到简单排序
             sorted_docs = sorted(documents, key=lambda x: x.get("weight", 0), reverse=True)
             return sorted_docs[:10]
@@ -291,7 +291,7 @@ class ChatService:
                     max_memories=3
                 )
             except Exception as e:
-                print(f"获取长期记忆失败: {e}")
+                logger.error(f"获取长期记忆失败: {e}")
 
         prompt = f"""你是一个智能助手，负责根据用户的问题和提供的参考内容生成回答。请严格按照以下要求生成回答：
 1. 回答必须基于提供的参考内容。
@@ -308,7 +308,7 @@ class ChatService:
 用户问题：{question}
 """
 
-        print(prompt)
+        logger.debug(f"Chat prompt length: {len(prompt)} chars")
 
         try:
             # 初始化 OpenAI 客户端

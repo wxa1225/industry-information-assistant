@@ -15,6 +15,14 @@ import asyncio
 from typing import Dict, Any, List, Literal, AsyncGenerator
 from datetime import datetime
 
+# LangGraph 导入 - 如果没有安装则使用简化版本
+try:
+    from langgraph.graph import StateGraph, END
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    logging.warning("LangGraph not installed. Using simplified workflow.")
+
 # 导入取消检查函数
 try:
     from router.research_router import is_research_cancelled, clear_cancel_flag
@@ -27,14 +35,6 @@ except ImportError:
             return False
         def clear_cancel_flag(session_id: str):
             pass
-
-# LangGraph 导入 - 如果没有安装则使用简化版本
-try:
-    from langgraph.graph import StateGraph, END
-    LANGGRAPH_AVAILABLE = True
-except ImportError:
-    LANGGRAPH_AVAILABLE = False
-    logging.warning("LangGraph not installed. Using simplified workflow.")
 
 from .state import ResearchState, ResearchPhase, create_initial_state
 from .agents import ChiefArchitect, DeepScout, CodeWizard, CriticMaster, LeadWriter, DataAnalyst
@@ -54,14 +54,82 @@ except ImportError:
 try:
     from config.llm_config import get_config
 except ImportError:
+    from app.config.llm_config import get_config
+
+# 可观测性导入
+try:
+    from service.observability import (
+        generate_trace_id, create_trace, add_trace_event, complete_trace, get_trace,
+        get_trace_summary, calculate_cost, format_cost,
+    )
+    OBS_AVAILABLE = True
+except ImportError:
     try:
-        from app.config.llm_config import get_config
+        from app.service.observability import (
+            generate_trace_id, create_trace, add_trace_event, complete_trace, get_trace,
+            get_trace_summary, calculate_cost, format_cost,
+        )
+        OBS_AVAILABLE = True
     except ImportError:
-        # 兼容直接运行脚本的情况
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        from config.llm_config import get_config
+        OBS_AVAILABLE = False
+        def generate_trace_id():
+            import uuid
+            return f"trace-{uuid.uuid4().hex[:12]}"
+        def create_trace(*a, **kw):
+            return None
+        def add_trace_event(*a, **kw):
+            pass
+        def complete_trace(*a, **kw):
+            pass
+        def get_trace(tid):
+            return None
+        def get_trace_summary(tid):
+            return {}
+        def calculate_cost(*a, **kw):
+            return 0.0
+        def format_cost(v):
+            return f"¥{v:.4f}"
+
+# 评估体系导入
+try:
+    from evaluation.metrics import compute_metrics, ResearchMetrics
+    from evaluation.report import generate_report
+    EVAL_AVAILABLE = True
+except ImportError:
+    try:
+        from app.evaluation.metrics import compute_metrics, ResearchMetrics
+        from app.evaluation.report import generate_report
+        EVAL_AVAILABLE = True
+    except ImportError:
+        EVAL_AVAILABLE = False
+        ResearchMetrics = None
+
+# 研究记忆集成导入
+try:
+    from service.research_memory import retrieve_relevant_memories, store_research_insights, build_memory_context
+    MEMORY_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.research_memory import retrieve_relevant_memories, store_research_insights, build_memory_context
+        MEMORY_AVAILABLE = True
+    except ImportError:
+        MEMORY_AVAILABLE = False
+        def retrieve_relevant_memories(*a, **kw): return []
+        def store_research_insights(*a, **kw): return 0
+        def build_memory_context(*a): return ""
+
+# 上下文裁剪导入
+try:
+    from service.context_pruner import prune_research_context, estimate_context_size
+    PRUNER_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.context_pruner import prune_research_context, estimate_context_size
+        PRUNER_AVAILABLE = True
+    except ImportError:
+        PRUNER_AVAILABLE = False
+        def prune_research_context(s, c=None): return s
+        def estimate_context_size(s): return {"total_tokens": 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("DeepResearchGraph")
@@ -252,16 +320,32 @@ class DeepResearchGraph:
         return dict(result)
 
     async def _analyze_node(self, state: ResearchState) -> Dict[str, Any]:
-        """分析节点"""
+        """分析节点 — 分析前先裁剪上下文防止 token 膨胀"""
         logger.info("Executing Analyze node...")
+
+        # 上下文裁剪：研究完成后 facts/messages 可能已经很多，裁剪后再进分析
+        if PRUNER_AVAILABLE:
+            context_size = estimate_context_size(state)
+            if context_size.get("total_tokens", 0) > 15000:
+                logger.info(f"[ContextPruner] 分析前上下文过大 ({context_size['total_tokens']} tokens)，执行裁剪")
+                state = prune_research_context(state)
+
         state = dict(state)
         state["phase"] = ResearchPhase.ANALYZING.value
         result = await self.wizard.process(state)
         return dict(result)
 
     async def _write_node(self, state: ResearchState) -> Dict[str, Any]:
-        """写作节点"""
+        """写作节点 — 写作前先裁剪上下文"""
         logger.info("Executing Write node...")
+
+        # 上下文裁剪：确保写作时上下文不会包含过多中间结果
+        if PRUNER_AVAILABLE:
+            context_size = estimate_context_size(state)
+            if context_size.get("total_tokens", 0) > 15000:
+                logger.info(f"[ContextPruner] 写作前上下文过大 ({context_size['total_tokens']} tokens)，执行裁剪")
+                state = prune_research_context(state)
+
         state = dict(state)
         state["phase"] = ResearchPhase.WRITING.value
         result = await self.writer.process(state)
@@ -276,8 +360,18 @@ class DeepResearchGraph:
         return dict(result)
 
     async def _revise_node(self, state: ResearchState) -> Dict[str, Any]:
-        """修订节点"""
+        """修订节点 — 修订前先裁剪上下文防止 token 膨胀"""
         logger.info("Executing Revise node...")
+
+        # 上下文裁剪：防止审核-修订循环中上下文无限膨胀
+        if PRUNER_AVAILABLE:
+            context_size_before = estimate_context_size(state)
+            if context_size_before.get("total_tokens", 0) > 15000:  # 超过 15k token 就裁剪
+                logger.info(f"[ContextPruner] 上下文过大 ({context_size_before['total_tokens']} tokens)，执行裁剪")
+                state = prune_research_context(state)
+                context_size_after = estimate_context_size(state)
+                logger.info(f"[ContextPruner] 裁剪后: {context_size_after['total_tokens']} tokens")
+
         state = dict(state)
         state["phase"] = ResearchPhase.REVISING.value
         result = await self.writer.process(state)
@@ -327,31 +421,54 @@ class DeepResearchGraph:
 
         # 如果没有检查点，创建初始状态
         if not state:
+            # 可观测性：生成 trace_id
+            trace_id = generate_trace_id()
             state = create_initial_state(
                 query, session_id,
+                trace_id=trace_id,
                 search_web=search_web,
-                search_local=search_local
+                search_local=search_local,
             )
             state["max_iterations"] = self.max_iterations
+
+            # 可观测性：创建 trace 记录
+            create_trace(trace_id=trace_id, query=query, session_id=session_id)
+            add_trace_event(
+                trace_id=trace_id, event_type="phase_start",
+                agent="system", summary=f"研究开始: {query[:80]}"
+            )
 
             yield {
                 "type": "research_start",
                 "query": query,
                 "session_id": session_id,
+                "trace_id": trace_id,
                 "search_web": search_web,
                 "search_local": search_local,
                 "timestamp": datetime.now().isoformat()
             }
 
+            # 跨 session 记忆：检索相关历史研究洞察（租户隔离）
+            if MEMORY_AVAILABLE:
+                mem_user_id = state.get("_user_id", "")
+                past_memories = retrieve_relevant_memories(query, user_id=mem_user_id, top_k=5)
+                memory_context = build_memory_context(past_memories)
+                state["memory_context"] = memory_context
+                if past_memories:
+                    logger.info(f"[Memory] 检索到 {len(past_memories)} 条相关历史记忆")
+                    yield {
+                        "type": "memory_retrieved",
+                        "count": len(past_memories),
+                        "memories": [
+                            {"type": m.get("memory_type"), "content": m.get("content")[:120]}
+                            for m in past_memories
+                        ],
+                    }
+
         # 存储 user_id 用于检查点
         state["_user_id"] = user_id
 
         # 始终使用手写版本执行（支持实时SSE流式输出）
-        # LangGraph 版本会批量处理消息，无法实现实时流式输出
-        # if LANGGRAPH_AVAILABLE and self.graph:
-        #     async for event in self._run_with_langgraph(state):
-        #         yield event
-        # else:
         async for event in self._run_simplified(state):
             yield event
 
@@ -451,7 +568,7 @@ class DeepResearchGraph:
                     msg = message_queue.get_nowait()
                     remaining += 1
                     yield msg
-                except:
+                except Exception:
                     break
 
             logger.info(f"Agent {agent.name} completed. Messages: {msg_count} during, {remaining} remaining")
@@ -568,14 +685,18 @@ class DeepResearchGraph:
             return None
 
         try:
+            trace_id = state.get("trace_id", "")
+
             # Phase 1: Plan
             if await check_cancelled():
                 yield {"type": "research_cancelled", "message": "研究已取消"}
                 return
+            add_trace_event(trace_id=trace_id, event_type="phase_start", agent="ChiefArchitect", summary="规划阶段开始")
             yield {"type": "phase", "phase": "planning", "content": "开始规划研究..."}
             state["phase"] = ResearchPhase.INIT.value
             async for msg in run_agent_with_streaming(self.architect):
                 yield msg
+            add_trace_event(trace_id=trace_id, event_type="phase_end", agent="ChiefArchitect", summary="规划阶段完成", metadata={"sections": len(state.get("outline", []))})
             state["messages"] = []
             # 保存检查点（含步骤信息）
             cp_event = await save_checkpoint_async({
@@ -590,10 +711,12 @@ class DeepResearchGraph:
             if await check_cancelled():
                 yield {"type": "research_cancelled", "message": "研究已取消"}
                 return
+            add_trace_event(trace_id=trace_id, event_type="phase_start", agent="DeepScout", summary="深度搜索阶段开始")
             yield {"type": "phase", "phase": "researching", "content": "开始深度搜索..."}
             state["phase"] = ResearchPhase.RESEARCHING.value
             async for msg in run_agent_with_streaming(self.scout):
                 yield msg
+            add_trace_event(trace_id=trace_id, event_type="phase_end", agent="DeepScout", summary="深度搜索阶段完成", metadata={"facts": len(state.get("facts", []))})
             state["messages"] = []
             # 保存检查点（含步骤信息）
             cp_event = await save_checkpoint_async({
@@ -607,17 +730,28 @@ class DeepResearchGraph:
             if cp_event:
                 yield cp_event
 
-            # Phase 3: Analyze
+            # Phase 3: Analyze — DataAnalyst + CodeWizard 串行执行
+            # 面试回答（7.1 减少 Agent step 数）：
+            # 当前 Analyze 阶段有两个 Agent 串行执行：
+            #   DataAnalyst: LLM 驱动的结构化数据提取 + 知识图谱 + ECharts JSON 配置（~3 次 LLM 调用）
+            #   CodeWizard: Python 代码执行的数据分析 + matplotlib 图表渲染（~1-2 次 LLM 调用）
+            # 两者的图表生成能力有重叠（都从相同数据生成图表），但 CodeWizard 的 Python
+            # 执行能力是 DataAnalyst 不具备的。
+            # 优化方案：可以合并为一个 "DataAnalyst" 步骤，让 LLM 一次性完成数据提取+分析计划，
+            # 然后 CodeWizard 只负责执行。这样减少 1 次 LLM 调用（知识图谱可异步）。
             if await check_cancelled():
                 yield {"type": "research_cancelled", "message": "研究已取消"}
                 return
+            add_trace_event(trace_id=trace_id, event_type="phase_start", agent="DataAnalyst", summary="数据分析阶段开始")
             yield {"type": "phase", "phase": "analyzing", "content": "开始数据分析..."}
             state["phase"] = ResearchPhase.ANALYZING.value
             async for msg in run_agent_with_streaming(self.data_analyst):
                 yield msg
             state["messages"] = []
+            add_trace_event(trace_id=trace_id, event_type="phase_start", agent="CodeWizard", summary="代码执行阶段开始")
             async for msg in run_agent_with_streaming(self.wizard):
                 yield msg
+            add_trace_event(trace_id=trace_id, event_type="phase_end", agent="CodeWizard", summary="数据分析阶段完成", metadata={"charts": len(state.get("charts", []))})
             state["messages"] = []
             # 保存检查点（含步骤信息）
             cp_event = await save_checkpoint_async({
@@ -632,10 +766,12 @@ class DeepResearchGraph:
             if await check_cancelled():
                 yield {"type": "research_cancelled", "message": "研究已取消"}
                 return
+            add_trace_event(trace_id=trace_id, event_type="phase_start", agent="LeadWriter", summary="撰写阶段开始")
             yield {"type": "phase", "phase": "writing", "content": "开始撰写报告..."}
             state["phase"] = ResearchPhase.WRITING.value
             async for msg in run_agent_with_streaming(self.writer):
                 yield msg
+            add_trace_event(trace_id=trace_id, event_type="phase_end", agent="LeadWriter", summary="撰写阶段完成", metadata={"report_length": len(state.get("final_report", ""))})
             state["messages"] = []
             # 保存检查点（含步骤信息）
             cp_event = await save_checkpoint_async({
@@ -647,15 +783,41 @@ class DeepResearchGraph:
                 yield cp_event
 
             # Phase 5 & 6: Review & Revise/Re-Research Loop
+            quality_history = []  # 收敛检测：追踪质量分数历史
             while state["iteration"] < state["max_iterations"]:
                 if await check_cancelled():
                     yield {"type": "research_cancelled", "message": "研究已取消"}
                     return
+                add_trace_event(trace_id=trace_id, event_type="phase_start", agent="CriticMaster", summary=f"审核阶段开始（第 {state['iteration'] + 1} 轮）")
                 yield {"type": "phase", "phase": "reviewing", "content": f"审核中（第 {state['iteration'] + 1} 轮）..."}
                 state["phase"] = ResearchPhase.REVIEWING.value
                 async for msg in run_agent_with_streaming(self.critic):
                     yield msg
+                add_trace_event(trace_id=trace_id, event_type="phase_end", agent="CriticMaster", summary=f"审核阶段完成", metadata={"quality_score": state.get("quality_score", 0.0)})
                 state["messages"] = []
+
+                # --- 收敛检测 ---
+                current_score = state.get("quality_score", 0.0)
+                quality_history.append(current_score)
+                if len(quality_history) >= 2:
+                    recent_improvement = quality_history[-1] - quality_history[-2]
+                    config = get_config()
+                    conv_rounds = config.research.convergence_rounds
+                    conv_threshold = config.research.convergence_threshold
+                    # 如果最近连续 N 轮提升都不超过阈值，强制结束
+                    if len(quality_history) >= conv_rounds + 1:
+                        recent_improvements = [
+                            quality_history[i] - quality_history[i-1]
+                            for i in range(len(quality_history) - conv_rounds, len(quality_history))
+                        ]
+                        if all(imp <= conv_threshold for imp in recent_improvements):
+                            logger.info(
+                                f"[Graph] 收敛检测: 最近 {conv_rounds} 轮质量提升均不超过 {conv_threshold}，"
+                                f"强制结束 (scores: {quality_history})"
+                            )
+                            state["phase"] = ResearchPhase.COMPLETED.value
+                            yield {"type": "convergence_reached", "quality_scores": quality_history}
+                            break
 
                 if state["phase"] == ResearchPhase.COMPLETED.value:
                     break
@@ -664,24 +826,29 @@ class DeepResearchGraph:
                     if await check_cancelled():
                         yield {"type": "research_cancelled", "message": "研究已取消"}
                         return
+                    add_trace_event(trace_id=trace_id, event_type="phase_start", agent="DeepScout", summary="补充搜索阶段开始")
                     yield {"type": "phase", "phase": "re_researching", "content": "根据审核反馈补充搜索..."}
                     async for msg in run_agent_with_streaming(self.scout):
                         yield msg
                     state["messages"] = []
 
+                    add_trace_event(trace_id=trace_id, event_type="phase_start", agent="LeadWriter", summary="重新撰写阶段开始")
                     yield {"type": "phase", "phase": "rewriting", "content": "基于新信息重新撰写..."}
                     state["phase"] = ResearchPhase.WRITING.value
                     async for msg in run_agent_with_streaming(self.writer):
                         yield msg
+                    add_trace_event(trace_id=trace_id, event_type="phase_end", agent="LeadWriter", summary="重新撰写完成")
                     state["messages"] = []
 
                 elif state["phase"] == ResearchPhase.REVISING.value:
                     if await check_cancelled():
                         yield {"type": "research_cancelled", "message": "研究已取消"}
                         return
+                    add_trace_event(trace_id=trace_id, event_type="phase_start", agent="LeadWriter", summary="修订阶段开始")
                     yield {"type": "phase", "phase": "revising", "content": "根据反馈修订报告..."}
                     async for msg in run_agent_with_streaming(self.writer):
                         yield msg
+                    add_trace_event(trace_id=trace_id, event_type="phase_end", agent="LeadWriter", summary="修订完成")
                     state["messages"] = []
                 else:
                     break
@@ -720,6 +887,82 @@ class DeepResearchGraph:
                     "source": "web"
                 })
 
+            # --- 可观测性：生成成本报告 ---
+            cost_report = {}
+            if OBS_AVAILABLE and trace_id:
+                summary = get_trace_summary(trace_id)
+                complete_trace(
+                    trace_id,
+                    status="completed",
+                    final_report=state.get("final_report", "")[:500],
+                    quality_score=state.get("quality_score", 0.0),
+                )
+
+                total_cost = 0.0
+                cost_by_agent = {}
+                for agent_name, agent_stats in summary.get("by_agent", {}).items():
+                    agent_cost = 0.0
+                    # 需要查每条记录的 model 来计算成本
+                    from service.observability import get_trace_stats
+                    for s in get_trace_stats(trace_id):
+                        if s.agent_name == agent_name:
+                            agent_cost += calculate_cost(s.model, s.input_tokens, s.output_tokens)
+                    agent_cost = round(agent_cost, 6)
+                    cost_by_agent[agent_name] = agent_cost
+                    total_cost += agent_cost
+
+                cost_report = {
+                    "trace_id": trace_id,
+                    "total_calls": summary.get("total_calls", 0),
+                    "total_input_tokens": summary.get("total_input_tokens", 0),
+                    "total_output_tokens": summary.get("total_output_tokens", 0),
+                    "total_tokens": summary.get("total_tokens", 0),
+                    "total_duration_ms": summary.get("total_duration_ms", 0),
+                    "successful_calls": summary.get("successful_calls", 0),
+                    "failed_calls": summary.get("failed_calls", 0),
+                    "cost_by_agent": cost_by_agent,
+                    "total_cost": round(total_cost, 6),
+                    "total_cost_formatted": format_cost(total_cost),
+                }
+
+            # --- 评估管线：自动计算 7 项指标 ---
+            eval_report = None
+            if EVAL_AVAILABLE:
+                try:
+                    metrics = compute_metrics(state)
+                    metrics_calc = ResearchMetrics()
+                    total_score = metrics_calc.weighted_score(metrics)
+                    state["_eval_metrics"] = {k: v.to_dict() for k, v in metrics.items()}
+                    state["_eval_total_score"] = total_score
+
+                    eval_report = generate_report(
+                        metrics=metrics,
+                        total_score=total_score,
+                        cost_report=cost_report if cost_report else None,
+                        conflict_report=state.get("conflict_report", None),
+                        title=f"研究评估报告 - {state.get('query', '')[:50]}",
+                    )
+                    logger.info(f"[Graph] 评估完成: 总分={total_score:.3f}")
+                except Exception as eval_error:
+                    logger.warning(f"[Graph] 评估失败: {eval_error}")
+                    eval_report = None
+
+            # --- 记忆持久化：研究完成后将高质量洞察写入长期记忆（租户隔离） ---
+            if MEMORY_AVAILABLE:
+                try:
+                    mem_user_id = state.get("_user_id", "")
+                    stored = store_research_insights(
+                        query=state.get("query", ""),
+                        facts=state.get("facts", []),
+                        insights=state.get("insights", []),
+                        user_id=mem_user_id,
+                        trace_id=trace_id,
+                    )
+                    if stored > 0:
+                        logger.info(f"[Memory] 存储 {stored} 条研究记忆")
+                except Exception as mem_err:
+                    logger.warning(f"[Memory] 存储研究记忆失败: {mem_err}")
+
             yield {
                 "type": "research_complete",
                 "final_report": state.get("final_report", ""),
@@ -727,7 +970,13 @@ class DeepResearchGraph:
                 "facts_count": len(state.get("facts", [])),
                 "charts_count": len(state.get("charts", [])),
                 "iterations": state.get("iteration", 0),
-                "references": final_ui_refs
+                "references": final_ui_refs,
+                "cost_report": cost_report,
+                "eval_report": eval_report,
+                "eval_score": state.get("_eval_total_score"),
+                "trace_id": trace_id,
+                # 交叉验证结果 — 前端"验证档案"面板数据源
+                "conflict_report": state.get("conflict_report", None),
             }
 
         except Exception as e:
@@ -735,6 +984,10 @@ class DeepResearchGraph:
             # 更新检查点状态为失败
             if self.checkpoint_service and session_id:
                 self.checkpoint_service.update_status(session_id, "failed", str(e))
+            # 可观测性：记录失败
+            trace_id = state.get("trace_id", "")
+            if OBS_AVAILABLE and trace_id:
+                complete_trace(trace_id, status="failed")
             yield {"type": "error", "content": str(e)}
         finally:
             # 清理队列

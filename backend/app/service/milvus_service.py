@@ -5,6 +5,9 @@
 import os
 from typing import List, Dict, Any, Optional
 from pymilvus import (
+import logging
+
+logger = logging.getLogger(__name__)
     connections,
     Collection,
     CollectionSchema,
@@ -31,9 +34,9 @@ class MilvusService:
                 host=self.host,
                 port=self.port,
             )
-            print(f"已连接到 Milvus: {self.host}:{self.port}")
+            logger.debug(f"已连接到 Milvus: {self.host}:{self.port}")
         except Exception as e:
-            print(f"连接 Milvus 失败: {e}")
+            logger.debug(f"连接 Milvus 失败: {e}")
             raise
 
     def create_collection(self, collection_name: str) -> Collection:
@@ -48,7 +51,7 @@ class MilvusService:
         """
         # 检查集合是否存在
         if utility.has_collection(collection_name):
-            print(f"集合 {collection_name} 已存在")
+            logger.debug(f"集合 {collection_name} 已存在")
             collection = Collection(collection_name)
             collection.load()
             return collection
@@ -78,7 +81,7 @@ class MilvusService:
         # 加载集合到内存
         collection.load()
 
-        print(f"集合 {collection_name} 创建成功")
+        logger.debug(f"集合 {collection_name} 创建成功")
         return collection
 
     def insert_documents(
@@ -119,7 +122,7 @@ class MilvusService:
         collection.insert(data)
         collection.flush()
 
-        print(f"成功插入 {len(documents)} 条文档到 {collection_name}")
+        logger.debug(f"成功插入 {len(documents)} 条文档到 {collection_name}")
         return len(documents)
 
     def search(
@@ -142,7 +145,7 @@ class MilvusService:
             搜索结果列表
         """
         if not utility.has_collection(collection_name):
-            print(f"集合 {collection_name} 不存在")
+            logger.debug(f"集合 {collection_name} 不存在")
             return []
 
         collection = Collection(collection_name)
@@ -200,10 +203,10 @@ class MilvusService:
             collection = Collection(collection_name)
             expr = f'doc_id == "{doc_id}"'
             collection.delete(expr)
-            print(f"已删除文档 {doc_id} 的所有切片")
+            logger.debug(f"已删除文档 {doc_id} 的所有切片")
             return True
         except Exception as e:
-            print(f"删除文档失败: {e}")
+            logger.debug(f"删除文档失败: {e}")
             return False
 
     def delete_collection(self, collection_name: str) -> bool:
@@ -219,10 +222,10 @@ class MilvusService:
         try:
             if utility.has_collection(collection_name):
                 utility.drop_collection(collection_name)
-                print(f"集合 {collection_name} 已删除")
+                logger.debug(f"集合 {collection_name} 已删除")
             return True
         except Exception as e:
-            print(f"删除集合失败: {e}")
+            logger.debug(f"删除集合失败: {e}")
             return False
 
     def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
@@ -263,7 +266,7 @@ class MilvusService:
             切片列表
         """
         if not utility.has_collection(collection_name):
-            print(f"集合 {collection_name} 不存在")
+            logger.debug(f"集合 {collection_name} 不存在")
             return []
 
         try:
@@ -284,7 +287,7 @@ class MilvusService:
 
             return results
         except Exception as e:
-            print(f"查询切片失败: {e}")
+            logger.debug(f"查询切片失败: {e}")
             return []
 
 

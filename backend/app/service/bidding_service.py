@@ -8,6 +8,9 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,7 +79,7 @@ class BiddingService:
         self.app_code = os.getenv("BID_APP_CODE", "")
 
         if not self.app_code:
-            print("警告: BID_APP_CODE 环境变量未设置")
+            logger.debug("警告: BID_APP_CODE 环境变量未设置")
 
     async def search_win_bids(
         self,

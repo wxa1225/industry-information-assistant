@@ -2,12 +2,15 @@
 # 未经授权，禁止转售或仿制。
 
 from typing import List, Dict, Any
+import logging
 from .chat_service import ChatService
 from .document_service import DocumentService
 from .web_search_service import WebSearchService
 from .session_service import SessionService
 from .policy_search_service import PolicySearchService
 import json
+
+logger = logging.getLogger(__name__)
 
 
 class ChatServiceV2(ChatService):
@@ -39,9 +42,8 @@ class ChatServiceV2(ChatService):
             List of retrieved documents
         """
         try:
-            print(f"\n{'='*50}")
-            print(f"政策文档检索请求: '{question}'")
-            print(f"{'='*50}")
+            logger.debug("政策文档检索请求开始")
+            logger.debug(f"政策文档检索请求: '{question}'")
             
             # 使用政策文档搜索服务进行混合检索
             response = self.policy_search_service.search(
@@ -50,14 +52,14 @@ class ChatServiceV2(ChatService):
                 top_n=top_n
             )
             
-            print(f"\n政策检索API响应:")
-            print(f"成功状态: {response.get('success', False)}")
-            print(f"检索方法: {response.get('method', 'unknown')}")
-            print(f"检索耗时: {response.get('took_ms', 0)}ms")
-            print(f"检索结果数: {response.get('total', 0)}")
+            logger.debug("政策检索API响应:")
+            logger.debug(f"成功状态: {response.get('success', False)}")
+            logger.debug(f"检索方法: {response.get('method', 'unknown')}")
+            logger.debug(f"检索耗时: {response.get('took_ms', 0)}ms")
+            logger.debug(f"检索结果数: {response.get('total', 0)}")
             
             if not response.get("success", False):
-                print(f"检索失败: {response.get('message', '未知错误')}")
+                logger.debug(f"检索失败: {response.get('message', '未知错误')}")
                 return []
                 
             # 从响应中提取文档
@@ -66,15 +68,13 @@ class ChatServiceV2(ChatService):
             seen_urls = set()
             
             if "results" in response:
-                print(f"\n{'='*50}")
-                print(f"检索到的政策文档详情:")
-                print(f"{'='*50}")
+                logger.debug("检索到的政策文档详情:")
                 
                 for i, result in enumerate(response["results"]):
                     # 检查URL是否已存在（去重逻辑）
                     detail_url = result.get("detail_url", "")
                     if detail_url and detail_url in seen_urls:
-                        print(f"跳过重复的文档: {result.get('title', '无标题')} - {detail_url}")
+                        logger.debug(f"跳过重复的文档: {result.get('title', '无标题')} - {detail_url}")
                         continue
                     
                     # 记录已处理的URL
@@ -89,13 +89,13 @@ class ChatServiceV2(ChatService):
                     if "highlights" in result and "content" in result["highlights"]:
                         highlighted_content = result["highlights"]["content"]
                     
-                    print(f"\n文档 #{i+1}:")
-                    print(f"标题: {result.get('title', '无标题')}")
-                    print(f"来源: {result.get('website', '未知来源')}")
-                    print(f"日期: {result.get('date', '未知日期')}")
-                    print(f"分数: {result.get('score', 0)}")
-                    print(f"链接: {detail_url}")
-                    print(f"内容预览: {highlighted_content[:200]}...")
+                    logger.debug(f"文档 #{i+1}:")
+                    logger.debug(f"标题: {result.get('title', '无标题')}")
+                    logger.debug(f"来源: {result.get('website', '未知来源')}")
+                    logger.debug(f"日期: {result.get('date', '未知日期')}")
+                    logger.debug(f"分数: {result.get('score', 0)}")
+                    logger.debug(f"链接: {detail_url}")
+                    logger.debug(f"内容预览: {highlighted_content[:200]}...")
                     
                     doc = {
                         "id": len(documents) + 1,  # 使用有序ID而不是原始索引i
@@ -108,11 +108,9 @@ class ChatServiceV2(ChatService):
                     }
                     documents.append(doc)
             
-            print(f"\n{'='*50}")
-            print(f"共处理 {len(documents)} 个政策文档检索结果（去重后）")
-            print(f"{'='*50}\n")
+            logger.debug(f"共处理 {len(documents)} 个政策文档检索结果（去重后）")
             
             return documents
         except Exception as e:
-            print(f"Error retrieving from policy documents: {str(e)}")
+            logger.error(f"Error retrieving from policy documents: {str(e)}")
             return [] 

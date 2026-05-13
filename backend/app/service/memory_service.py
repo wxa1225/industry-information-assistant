@@ -20,11 +20,15 @@ from sqlalchemy.orm import Session
 from openai import OpenAI
 
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 from models.chat import ChatSession, ChatMessage, LongTermMemory
 from service.embedding_service import generate_embedding
 from service.milvus_service import get_milvus_service, MilvusService
+from service.memory_noise_filter import MemoryNoiseFilter
 
 # 记忆触发阈值
 MEMORY_TOKEN_THRESHOLD = 10000  # 超过此 token 数触发记忆压缩
@@ -40,6 +44,8 @@ class MemoryService:
         self.model = os.getenv("DASHSCOPE_MODEL", "qwen-plus")
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self._milvus: Optional[MilvusService] = None
+        self._noise_filter = MemoryNoiseFilter()
+        self._load_existing_memory_summaries()
 
     @property
     def milvus(self) -> MilvusService:
@@ -81,7 +87,40 @@ class MemoryService:
         collection.create_index(field_name="vector", index_params=index_params)
         collection.load()
 
-        print(f"记忆集合 {collection_name} 创建成功")
+        logger.debug(f"记忆集合 {collection_name} 创建成功")
+
+    def _load_existing_memory_summaries(self):
+        """从数据库加载已有记忆摘要，用于噪声过滤的语义去重。"""
+        try:
+            from core.database import SessionLocal
+            db = SessionLocal()
+            summaries = [
+                m.summary for m in db.query(LongTermMemory).all()
+                if m.summary
+            ]
+            db.close()
+            if summaries:
+                self._noise_filter.register_existing_memories(summaries)
+                logger.debug(f"已加载 {len(summaries)} 条记忆摘要用于噪声过滤")
+        except Exception as e:
+            logger.debug(f"加载已有记忆摘要失败: {e}")
+
+    def _estimate_similarity(self, text_a: str, text_b: str) -> float:
+        """基于 embedding 余弦相似度估算语义相似度。"""
+        try:
+            vec_a = generate_embedding(text_a[:500])
+            vec_b = generate_embedding(text_b[:500])
+            if not vec_a or not vec_b:
+                return 0.0
+            # 余弦相似度
+            dot = sum(a * b for a, b in zip(vec_a, vec_b))
+            norm_a = sum(a * a for a in vec_a) ** 0.5
+            norm_b = sum(b * b for b in vec_b) ** 0.5
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+        except Exception:
+            return 0.0
 
     def estimate_tokens(self, text: str) -> int:
         """估算文本的 token 数量（简单估算：中文约2字符/token，英文约4字符/token）"""
@@ -155,7 +194,7 @@ class MemoryService:
             return json.loads(result_text.strip())
 
         except Exception as e:
-            print(f"总结对话失败: {e}")
+            logger.debug(f"总结对话失败: {e}")
             # 返回默认结构
             return {
                 "summary": f"对话包含 {len(messages)} 条消息",
@@ -189,15 +228,18 @@ class MemoryService:
         # 总结对话
         summary_data = self.summarize_conversation(messages)
 
+        # 噪声过滤：过滤掉低价值的摘要和洞察
+        filtered_summary_data = self._filter_summary_data(summary_data)
+
         # 计算 token 数
         total_tokens = sum(self.estimate_tokens(msg.content) for msg in messages)
 
-        # 创建数据库记录
+        # 创建数据库记录（使用过滤后的数据）
         memory = LongTermMemory(
             user_id=user_id,
             session_id=session_id,
-            summary=summary_data.get("summary", ""),
-            key_insights=summary_data,
+            summary=filtered_summary_data.get("summary", ""),
+            key_insights=filtered_summary_data,
             token_count=total_tokens,
         )
 
@@ -205,20 +247,67 @@ class MemoryService:
         db.commit()
         db.refresh(memory)
 
-        # 向量化并存储到 Milvus
+        # 向量化并存储到 Milvus（使用过滤后的数据）
         milvus_ids = self._store_memory_vectors(
             memory_id=str(memory.id),
             user_id=user_id,
             session_id=session_id,
-            summary_data=summary_data
+            summary_data=filtered_summary_data
         )
 
         # 更新 Milvus IDs
         memory.milvus_ids = milvus_ids
         db.commit()
 
-        print(f"创建长期记忆成功: {memory.id}")
+        logger.debug(f"创建长期记忆成功: {memory.id}")
         return memory
+
+    def _filter_summary_data(self, summary_data: Dict[str, Any]) -> Dict[str, Any]:
+        """对 LLM 生成的总结内容进行噪声过滤。"""
+        filtered = {
+            "summary": "",
+            "key_insights": [],
+            "user_preferences": summary_data.get("user_preferences", {}),
+            "topics": [],
+        }
+
+        # 过滤 summary
+        summary = summary_data.get("summary", "")
+        is_noise, reason = self._noise_filter.is_noise(
+            summary,
+            semantic_similarity_fn=self._estimate_similarity,
+        )
+        if not is_noise:
+            filtered["summary"] = summary
+            self._noise_filter.add_to_registry(summary)
+        else:
+            logger.debug(f"记忆摘要被噪声过滤器拦截: {reason}")
+
+        # 过滤 key_insights
+        for insight in summary_data.get("key_insights", []):
+            is_noise, reason = self._noise_filter.is_noise(
+                insight,
+                semantic_similarity_fn=self._estimate_similarity,
+            )
+            if not is_noise:
+                filtered["key_insights"].append(insight)
+                self._noise_filter.add_to_registry(insight)
+            else:
+                logger.debug(f"洞察被噪声过滤器拦截: {reason}")
+
+        # 过滤 topics（合并后过滤）
+        topics = summary_data.get("topics", [])
+        if topics:
+            topics_text = "用户关注的主题: " + ", ".join(topics)
+            is_noise, reason = self._noise_filter.is_noise(
+                topics_text,
+                semantic_similarity_fn=self._estimate_similarity,
+            )
+            if not is_noise:
+                filtered["topics"] = topics
+                self._noise_filter.add_to_registry(topics_text)
+
+        return filtered
 
     def _store_memory_vectors(
         self,
@@ -304,9 +393,9 @@ class MemoryService:
                 collection.insert(data)
                 collection.flush()
 
-                print(f"成功存储 {len(documents_to_insert)} 条记忆向量")
+                logger.debug(f"成功存储 {len(documents_to_insert)} 条记忆向量")
             except Exception as e:
-                print(f"存储记忆向量失败: {e}")
+                logger.debug(f"存储记忆向量失败: {e}")
 
         return milvus_ids
 
@@ -317,7 +406,13 @@ class MemoryService:
         top_k: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        检索与查询相关的记忆
+        检索与查询相关的记忆（混合召回：语义 + 时间衰减 + 重要性加权）。
+
+        召回策略：
+        1. 语义相似度搜索（Milvus vector search）
+        2. 时间衰减因子 — 近期记忆权重更高，按指数衰减
+        3. 重要性加权 — 根据记忆类型和 content 长度赋予基础重要性
+        4. 最终评分 = 语义得分 × 0.6 + 时间衰减得分 × 0.25 + 重要性得分 × 0.15
 
         Args:
             user_id: 用户ID
@@ -325,7 +420,7 @@ class MemoryService:
             top_k: 返回结果数量
 
         Returns:
-            相关记忆列表
+            相关记忆列表（按综合评分排序）
         """
         from pymilvus import Collection, utility
 
@@ -346,14 +441,16 @@ class MemoryService:
 
             search_params = {
                 "metric_type": "COSINE",
-                "params": {"nprobe": 10},
+                "params": {"nprobe": 16},
             }
 
+            # 召回更多候选（用于后续重排序）
+            candidate_k = top_k * 3
             results = collection.search(
                 data=[query_vector],
                 anns_field="vector",
                 param=search_params,
-                limit=top_k,
+                limit=candidate_k,
                 expr=expr,
                 output_fields=["id", "session_id", "memory_type", "content", "metadata"],
             )
@@ -367,14 +464,114 @@ class MemoryService:
                         "memory_type": hit.entity.get("memory_type"),
                         "content": hit.entity.get("content"),
                         "metadata": hit.entity.get("metadata"),
-                        "score": hit.score,
+                        "semantic_score": hit.score,
                     })
 
-            return formatted_results
+            # 混合重排序
+            reranked = self._rerank_memories(formatted_results, top_k)
+            return reranked
 
         except Exception as e:
-            print(f"检索记忆失败: {e}")
+            logger.debug(f"检索记忆失败: {e}")
             return []
+
+    def _rerank_memories(
+        self,
+        candidates: List[Dict[str, Any]],
+        top_k: int
+    ) -> List[Dict[str, Any]]:
+        """
+        对候选记忆进行重排序。
+
+        综合评分 = semantic_score × 0.6 + time_decay_score × 0.25 + importance_score × 0.15
+        """
+        now = datetime.utcnow()
+
+        scored = []
+        for mem in candidates:
+            # 1. 语义得分（已在 Milvus 搜索中计算，归一化到 0-1）
+            semantic_score = mem.get("semantic_score", 0.0)
+
+            # 2. 时间衰减得分
+            time_decay_score = self._compute_time_decay(mem, now)
+
+            # 3. 重要性得分
+            importance_score = self._compute_importance(mem)
+
+            # 综合评分
+            final_score = (
+                semantic_score * 0.6 +
+                time_decay_score * 0.25 +
+                importance_score * 0.15
+            )
+
+            mem["final_score"] = final_score
+            mem["time_decay_score"] = time_decay_score
+            mem["importance_score"] = importance_score
+            scored.append(mem)
+
+        # 按综合评分排序，取 top_k
+        scored.sort(key=lambda x: x["final_score"], reverse=True)
+        return scored[:top_k]
+
+    def _compute_time_decay(self, memory: Dict[str, Any], now: datetime) -> float:
+        """
+        计算时间衰减因子。
+
+        从 metadata 中提取 created_at（如果有），否则默认 1.0（最新）。
+        使用指数衰减: decay = e^(-λ * days)，λ = 0.05（半衰期约 14 天）。
+        """
+        import math
+
+        metadata = memory.get("metadata", "{}")
+        try:
+            meta = json.loads(metadata) if isinstance(metadata, str) else metadata
+            created_at_str = meta.get("created_at")
+            if created_at_str:
+                created_at = datetime.fromisoformat(created_at_str)
+                days_old = (now - created_at).days
+                decay_rate = 0.05
+                return math.exp(-decay_rate * days_old)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # 没有时间信息时给较高权重（假设是近期记忆）
+        return 0.8
+
+    def _compute_importance(self, memory: Dict[str, Any]) -> float:
+        """
+        计算记忆重要性。
+
+        基于：
+        - 记忆类型：insight > summary > topics
+        - 内容长度：更长通常意味着更详细的信息
+        - 是否包含具体数据/实体
+        """
+        score = 0.0
+
+        memory_type = memory.get("memory_type", "unknown")
+        type_weights = {
+            "insight": 0.5,
+            "summary": 0.3,
+            "topics": 0.2,
+        }
+        score += type_weights.get(memory_type, 0.1)
+
+        content = memory.get("content", "")
+        # 内容长度得分（归一化到 0-0.3）
+        length_score = min(len(content) / 300, 0.3)
+        score += length_score
+
+        # 包含数字/实体（意味着更具体的信息）
+        import re
+        has_numbers = bool(re.search(r"\d+\.?\d*%?", content))
+        has_entities = bool(re.search(r"[A-Z][a-zA-Z]+|「.*?」", content))
+        if has_numbers:
+            score += 0.1
+        if has_entities:
+            score += 0.1
+
+        return min(score, 1.0)
 
     def get_user_memories(
         self,
@@ -412,7 +609,7 @@ class MemoryService:
                     expr = f'id == "{milvus_id}"'
                     collection.delete(expr)
             except Exception as e:
-                print(f"删除 Milvus 记忆失败: {e}")
+                logger.debug(f"删除 Milvus 记忆失败: {e}")
 
         # 删除数据库记录
         db.delete(memory)

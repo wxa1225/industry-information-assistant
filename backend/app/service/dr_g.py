@@ -26,9 +26,13 @@ from collections import Counter
 import logging
 
 # --- Configuration ---
-SEARCH_API_KEY = os.getenv("BOCHA_API_KEY", "Bearer sk-392ef5953eaa4c43be43e6daab4e82a4")
-LLM_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-f02db5a079ab41588b1cab09ad2777a2")
+SEARCH_API_KEY = os.getenv("BOCHA_API_KEY", "")
+LLM_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 LLM_BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+# 注意：API Key 必须通过环境变量配置，不要硬编码在代码中
+if not LLM_API_KEY:
+    raise ValueError("请设置 DASHSCOPE_API_KEY 环境变量（在 .env 文件中配置）")
 
 # 优化配置
 MAX_CONCURRENT_SEARCHES = 3
@@ -367,7 +371,7 @@ class ResearchService:
                             current_subqueries = [query]
                         else:
                             yield serialize_event({"type": "subqueries", "content": current_subqueries})
-                    except:
+                    except Exception:
                         current_subqueries = [query]
 
             elif not current_subqueries:

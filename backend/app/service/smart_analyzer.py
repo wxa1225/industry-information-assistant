@@ -221,7 +221,7 @@ class SmartDataAnalyzer:
             if numbers:
                 try:
                     item["value"] = float(numbers[0].replace(',', ''))
-                except:
+                except Exception:
                     pass
 
             # 提取百分比
@@ -273,7 +273,7 @@ class SmartDataAnalyzer:
                         }
                         if len(numeric_values) > 1:
                             stats['std'] = statistics.stdev(numeric_values)
-                except:
+                except Exception:
                     pass
 
             profile = ColumnProfile(
@@ -324,7 +324,7 @@ class SmartDataAnalyzer:
             try:
                 float(value.replace(',', ''))
                 return True
-            except:
+            except Exception:
                 return False
         return False
 

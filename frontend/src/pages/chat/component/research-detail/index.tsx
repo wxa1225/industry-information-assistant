@@ -3,13 +3,14 @@
  * 未经授权，禁止转售或仿制。
  */
 
-import { FileTextOutlined, ShareAltOutlined, BarChartOutlined, CheckOutlined, LoadingOutlined, FileMarkdownOutlined } from '@ant-design/icons'
+import { FileTextOutlined, ShareAltOutlined, BarChartOutlined, CheckOutlined, LoadingOutlined, FileMarkdownOutlined, SafetyOutlined } from '@ant-design/icons'
 import { useState } from 'react'
 import classNames from 'classnames'
 import SearchResults from './search-results'
 import KnowledgeGraph from './knowledge-graph'
 import Visualization from './visualization'
 import ProcessReport, { SectionDraft } from './process-report'
+import VerificationArchive from './verification-archive'
 import styles from './index.module.scss'
 
 export interface SearchResult {
@@ -63,6 +64,7 @@ export interface ResearchDetailData {
   charts?: ChartConfig[]
   streamingReport?: string  // 最终报告
   sections?: SectionDraft[]  // 章节草稿
+  conflictReport?: Record<string, unknown> | null  // 交叉验证结果
 }
 
 export interface ResearchStep {
@@ -81,7 +83,7 @@ interface ResearchDetailProps {
   onClose?: () => void
 }
 
-type TabKey = 'results' | 'graph' | 'charts' | 'report'
+type TabKey = 'results' | 'graph' | 'charts' | 'report' | 'verification'
 
 const stepLabels: Record<ResearchStep['type'], string> = {
   planning: '研究计划',
@@ -145,6 +147,12 @@ export default function ResearchDetail({ data, steps = [], onStepClick, onClose 
       icon: <FileMarkdownOutlined />,
       count: reportCount > 0 ? reportCount : undefined,
     },
+    {
+      key: 'verification',
+      label: '验证档案',
+      icon: <SafetyOutlined />,
+      count: data?.conflictReport?.conflicts_detected,
+    },
   ]
 
   return (
@@ -202,6 +210,7 @@ export default function ResearchDetail({ data, steps = [], onStepClick, onClose 
         {activeTab === 'graph' && <KnowledgeGraph data={data?.knowledgeGraph} />}
         {activeTab === 'charts' && <Visualization charts={data?.charts} />}
         {activeTab === 'report' && <ProcessReport content={data?.streamingReport} sections={data?.sections} charts={data?.charts} knowledgeGraph={data?.knowledgeGraph} />}
+        {activeTab === 'verification' && <VerificationArchive report={data?.conflictReport as any} />}
       </div>
     </div>
   )

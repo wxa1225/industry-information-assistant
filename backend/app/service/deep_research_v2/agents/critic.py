@@ -12,11 +12,28 @@ DeepResearch V2.0 - 毒舌评论家 Agent (CriticMaster)
 """
 
 import uuid
+import logging
 from typing import Dict, Any, List
 from datetime import datetime
 
 from .base import BaseAgent
 from ..state import ResearchState, ResearchPhase
+
+# 交叉验证模块
+try:
+    from service.conflict_detector import ConflictDetector, CrossValidator, ConfidenceScorer
+    CONFLICT_MODULE_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.conflict_detector import ConflictDetector, CrossValidator, ConfidenceScorer
+        CONFLICT_MODULE_AVAILABLE = True
+    except ImportError:
+        CONFLICT_MODULE_AVAILABLE = False
+        ConflictDetector = None
+        CrossValidator = None
+        ConfidenceScorer = None
+
+logger = logging.getLogger(__name__)
 
 
 class CriticMaster(BaseAgent):
@@ -167,6 +184,14 @@ class CriticMaster(BaseAgent):
         review_result = await self._review_content(state)
         self.logger.info(f"[CriticMaster] 审核完成，结果: {bool(review_result)}")
 
+        # --- 交叉验证：检测并解决事实冲突 ---
+        if CONFLICT_MODULE_AVAILABLE and len(state.get("facts", [])) >= 3:
+            self.add_message(state, "thought", {
+                "agent": self.name,
+                "content": "启动交叉验证：检测事实矛盾并寻找第三方证据"
+            })
+            await self._run_cross_validation(state)
+
         if review_result:
             # 记录反馈
             for issue in review_result.get("issues", []):
@@ -281,6 +306,168 @@ class CriticMaster(BaseAgent):
             "search_queries": list(set(search_queries))[:5]  # 去重，最多5个查询
         }
 
+    async def _run_cross_validation(self, state: ResearchState) -> None:
+        """
+        运行交叉验证 pipeline：
+        1. 检测事实冲突
+        2. 对冲突进行补充搜索验证
+        3. 更新所有事实的置信度评分
+
+        结果写入 state["conflict_report"]，包含：
+        - conflicts: 检测到的冲突列表
+        - validation_results: 验证结果
+        - confidence_scores: 每个事实的置信度
+        """
+        facts = state.get("facts", [])
+        if len(facts) < 3:
+            self.logger.info(f"[CriticMaster] 事实数量 {len(facts)} 不足，跳过交叉验证")
+            return
+
+        trace_id = state.get("trace_id", "")
+
+        # 1. 规则冲突检测
+        detector = ConflictDetector(conflict_threshold=0.3)
+        conflicts = detector.detect(facts)
+        self.logger.info(f"[CriticMaster] 规则检测发现 {len(conflicts)} 个冲突")
+
+        # 记录 trace 事件
+        if trace_id:
+            try:
+                from service.observability import add_trace_event
+                add_trace_event(
+                    trace_id=trace_id, event_type="conflict_detection",
+                    agent="CriticMaster",
+                    summary=f"检测到 {len(conflicts)} 个事实冲突",
+                    metadata={"conflict_count": len(conflicts)},
+                )
+            except ImportError:
+                pass
+
+        # 2. 交叉验证（如果有冲突）
+        validation_results = {}
+        if conflicts:
+            self.add_message(state, "conflict_summary", {
+                "agent": self.name,
+                "conflicts_detected": len(conflicts),
+                "conflicts": [c.to_dict() for c in conflicts[:5]],  # 最多展示前 5 个
+            })
+
+            # 创建验证器
+            async def search_fn(query: str) -> List[Dict]:
+                """包装搜索函数"""
+                try:
+                    # 使用 DeepScout 的搜索能力
+                    from service.deep_research_v2.agents.scout import DeepScout
+                    from config.llm_config import get_config
+                    config = get_config()
+                    # 这里复用搜索逻辑
+                    results = await self._quick_search(query)
+                    return results
+                except Exception as e:
+                    self.logger.warning(f"[CriticMaster] 交叉验证搜索失败: {e}")
+                    return []
+
+            validator = CrossValidator(
+                llm_call_fn=lambda sys, usr: self._sync_llm_call(sys, usr),
+                search_fn=search_fn,
+            )
+
+            val_results = await validator.validate_all(conflicts, max_per_conflict=3)
+            for vr in val_results:
+                fact_a_id = vr.conflict_pair.fact_a.get("id", "")
+                fact_b_id = vr.conflict_pair.fact_b.get("id", "")
+                validation_results[fact_a_id] = vr.to_dict()
+                validation_results[fact_b_id] = vr.to_dict()
+
+        # 3. 置信度评分
+        scorer = ConfidenceScorer()
+        confidence_results = scorer.score_all(
+            facts,
+            validation_results=validation_results,
+            conflict_pairs=conflicts,
+        )
+
+        # 更新每个事实的置信度
+        for fact in facts:
+            fid = fact.get("id", "")
+            if fid in confidence_results:
+                result = confidence_results[fid]
+                fact["confidence_score"] = result.overall_score
+                fact["confidence_breakdown"] = result.to_dict()
+
+        # 将交叉验证结果写入 state
+        state["conflict_report"] = {
+            "conflicts_detected": len(conflicts),
+            "conflicts": [c.to_dict() for c in conflicts],
+            "validation_results": validation_results,
+            "confidence_scores": {
+                fid: r.to_dict() for fid, r in confidence_results.items()
+            },
+        }
+
+        self.logger.info(f"[CriticMaster] 交叉验证完成: {len(conflicts)} 个冲突, "
+                        f"{len(confidence_results)} 条事实评分完成")
+
+    async def _quick_search(self, query: str) -> List[Dict]:
+        """快速搜索（用于交叉验证的补充搜索）"""
+        try:
+            import httpx
+            from service.config import ServiceConfig
+            config = ServiceConfig.get_api_config()
+            api_key = config.get('bochaai_api_key', '')
+            api_url = "https://api.bochaai.com/v1/web-search"
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    api_url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"query": query, "count": 5},
+                )
+                data = resp.json()
+                results = []
+                for item in data.get("data", {}).get("webPages", {}).get("value", []):
+                    results.append({
+                        "title": item.get("name", ""),
+                        "snippet": item.get("snippet", ""),
+                        "url": item.get("url", ""),
+                        "source_name": item.get("name", ""),
+                    })
+                return results
+        except Exception as e:
+            self.logger.warning(f"[CriticMaster] 快速搜索失败: {e}")
+            return []
+
+    def _sync_llm_call(self, system_prompt: str, user_prompt: str) -> str:
+        """同步 LLM 调用（用于交叉验证器）"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 在已有的事件循环中创建任务
+            future = asyncio.ensure_future(
+                self.call_llm(system_prompt, user_prompt, json_mode=True)
+            )
+            # 由于我们在异步上下文中，需要特殊处理
+            # 最简单的方法是直接调用
+            import nest_asyncio
+            try:
+                nest_asyncio.apply()
+                return loop.run_until_complete(
+                    self.call_llm(system_prompt, user_prompt, json_mode=True)
+                )
+            except Exception:
+                # 如果 nest_asyncio 不可用，创建一个新的事件循环
+                new_loop = asyncio.new_event_loop()
+                try:
+                    return new_loop.run_until_complete(
+                        self.call_llm(system_prompt, user_prompt, json_mode=True)
+                    )
+                finally:
+                    new_loop.close()
+        else:
+            return loop.run_until_complete(
+                self.call_llm(system_prompt, user_prompt, json_mode=True)
+            )
+
     async def _review_content(self, state: ResearchState) -> Dict[str, Any]:
         """审核内容"""
         self.logger.info(f"[CriticMaster] _review_content 开始")
@@ -320,12 +507,15 @@ class CriticMaster(BaseAgent):
         )
 
         self.logger.info(f"[CriticMaster] 调用 LLM 进行审核...")
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是一位极其严苛的质量审核专家，专门找出研究报告中的问题。你永远不会轻易满意。",
             user_prompt=prompt,
             json_mode=True,
             temperature=0.2,
-            max_tokens=16000  # 拉满到最大值
+            max_tokens=16000,  # 拉满到最大值
+            context_layers=context_layers,
         )
         self.logger.info(f"[CriticMaster] LLM 响应长度: {len(response)}")
 
@@ -347,10 +537,13 @@ class CriticMaster(BaseAgent):
             revised_content=state.get("final_report", "")[:8000]
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是最终质量把关人。",
             user_prompt=prompt,
-            json_mode=True
+            json_mode=True,
+            context_layers=context_layers,
         )
 
         return self.parse_json_response(response)

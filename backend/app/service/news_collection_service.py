@@ -616,7 +616,7 @@ class NewsCollectionService:
                     year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
                     if 2020 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
                         return datetime(year, month, day)
-                except:
+                except Exception:
                     pass
 
         return None
@@ -640,7 +640,7 @@ class NewsCollectionService:
         for fmt in formats:
             try:
                 return datetime.strptime(date_str.split('.')[0].split('+')[0], fmt)
-            except:
+            except Exception:
                 pass
 
         return None
@@ -691,7 +691,7 @@ class NewsCollectionService:
             if len(parts) >= 2:
                 return '.'.join(parts[-2:])
             return domain
-        except:
+        except Exception:
             return "未知来源"
 
     def _extract_department(self, title: str, content: str) -> Optional[str]:

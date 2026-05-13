@@ -12,6 +12,9 @@
 from typing import List, Dict, Any, Optional
 from service.milvus_service import get_milvus_service
 from service.embedding_service import generate_embedding
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def retrieve_content(
@@ -36,7 +39,7 @@ def retrieve_content(
         # 1. 生成查询向量
         query_vectors = generate_embedding([question])
         if not query_vectors or len(query_vectors) == 0:
-            print("生成查询向量失败")
+            logger.debug("生成查询向量失败")
             return []
 
         query_vector = query_vectors[0]
@@ -65,7 +68,7 @@ def retrieve_content(
         return extracted_data
 
     except Exception as e:
-        print(f"检索错误: {str(e)}")
+        logger.debug(f"检索错误: {str(e)}")
         import traceback
         traceback.print_exc()
         return []

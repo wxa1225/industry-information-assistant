@@ -53,6 +53,7 @@ declare namespace API {
     charts?: ChartConfig[]
     insights?: string[]
     stockQuote?: StockQuoteData  // 股票实时行情
+    conflictReport?: Record<string, unknown> | null  // 交叉验证结果
   }
 
   // 股票行情数据

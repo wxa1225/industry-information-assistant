@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from starlette.status import HTTP_200_OK, HTTP_400_BAD_REQUEST, HTTP_500_INTERNAL_SERVER_ERROR
+from starlette.status import HTTP_200_OK, HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND, HTTP_500_INTERNAL_SERVER_ERROR, HTTP_501_NOT_IMPLEMENTED
 import logging
 
 from service import ResearchService, ServiceConfig
@@ -14,6 +14,31 @@ from core.redis_client import cache  # 导入 Redis 缓存
 
 # V2 导入
 from service.deep_research_v2.service import DeepResearchV2Service
+
+# 健康检查
+try:
+    from service.health_checker import get_health_checker
+    HEALTH_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.health_checker import get_health_checker
+        HEALTH_AVAILABLE = True
+    except ImportError:
+        HEALTH_AVAILABLE = False
+
+# 可观测性导入
+try:
+    from service.observability import get_trace, get_all_traces_info, get_trace_summary
+    OBS_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.observability import get_trace, get_all_traces_info, get_trace_summary
+        OBS_AVAILABLE = True
+    except ImportError:
+        OBS_AVAILABLE = False
+        get_trace = None
+        get_all_traces_info = None
+        get_trace_summary = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ResearchRouter")
@@ -513,3 +538,217 @@ async def resume_research(session_id: str):
     except Exception as e:
         logger.error(f"Failed to resume research: {e}")
         raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ============ 可观测性 / Trace API ============
+
+@router.get("/trace/{trace_id}", status_code=HTTP_200_OK)
+async def get_trace_info(trace_id: str):
+    """
+    获取一次研究的完整 Trace 信息（执行轨迹 + 成本报告）。
+
+    Args:
+        trace_id: 研究追踪 ID
+
+    Returns:
+        完整的 Trace 记录，包含所有事件和成本统计
+    """
+    if not OBS_AVAILABLE:
+        raise HTTPException(
+            status_code=HTTP_501_NOT_IMPLEMENTED,
+            detail="Observability module not available"
+        )
+
+    trace = get_trace(trace_id)
+    if not trace:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Trace {trace_id} not found"
+        )
+
+    # 获取 token 统计摘要
+    try:
+        from service.observability import get_trace_summary, calculate_cost, get_trace_stats
+        token_summary = get_trace_summary(trace_id)
+
+        total_cost = 0.0
+        cost_by_agent = {}
+        for s in get_trace_stats(trace_id):
+            cost = calculate_cost(s.model, s.input_tokens, s.output_tokens)
+            cost_by_agent[s.agent_name] = cost_by_agent.get(s.agent_name, 0.0) + cost
+            total_cost += cost
+
+        cost_report = {
+            "total_calls": token_summary.get("total_calls", 0),
+            "total_input_tokens": token_summary.get("total_input_tokens", 0),
+            "total_output_tokens": token_summary.get("total_output_tokens", 0),
+            "total_tokens": token_summary.get("total_tokens", 0),
+            "total_duration_ms": token_summary.get("total_duration_ms", 0),
+            "successful_calls": token_summary.get("successful_calls", 0),
+            "failed_calls": token_summary.get("failed_calls", 0),
+            "cost_by_agent": {k: round(v, 6) for k, v in cost_by_agent.items()},
+            "total_cost": round(total_cost, 6),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to calculate cost report: {e}")
+        cost_report = {"error": str(e)}
+
+    return {
+        "success": True,
+        "trace": trace.to_dict(),
+        "cost_report": cost_report,
+    }
+
+
+@router.get("/traces", status_code=HTTP_200_OK)
+async def list_traces(
+    status: Optional[str] = Query(None, description="过滤状态: running/completed/failed/cancelled"),
+    limit: int = Query(20, ge=1, le=100, description="返回数量限制")
+):
+    """
+    列出所有研究的 Trace 摘要。
+
+    Args:
+        status: 状态过滤
+        limit: 返回数量限制
+
+    Returns:
+        Trace 摘要列表
+    """
+    if not OBS_AVAILABLE:
+        raise HTTPException(
+            status_code=HTTP_501_NOT_IMPLEMENTED,
+            detail="Observability module not available"
+        )
+
+    traces = get_all_traces_info()
+    if status:
+        traces = [t for t in traces if t.get("status") == status]
+    # 按 start_time 倒序
+    traces = sorted(traces, key=lambda t: t.get("start_time", ""), reverse=True)
+    return {
+        "success": True,
+        "traces": traces[:limit],
+        "total": len(traces),
+    }
+
+
+# ============ 优化 #2: 健康检查 API ============
+
+@router.get("/health", status_code=HTTP_200_OK)
+async def health_check():
+    """
+    系统健康检查端点。
+
+    检查 LLM API、搜索 API、Milvus 等依赖服务的连通性和延迟。
+    如果模块不可用，返回 degraded/unhealthy 状态。
+    """
+    if not HEALTH_AVAILABLE:
+        return {
+            "status": "unknown",
+            "message": "Health checker not available",
+        }
+
+    checker = get_health_checker()
+    # 立即触发一次检查
+    await checker.check_all()
+
+    health = checker.get_health()
+    overall = checker.get_overall_status()
+
+    result = {
+        "status": overall,
+        "services": {},
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    for name, svc in health.items():
+        result["services"][name] = {
+            "status": svc.status,
+            "latency_ms": svc.latency_ms,
+            "error": svc.error,
+            "consecutive_failures": svc.consecutive_failures,
+            "total_checks": svc.total_checks,
+            "total_failures": svc.total_failures,
+        }
+
+    return result
+
+
+# ============ 优化 #1: 并发统计 API ============
+
+@router.get("/stats", status_code=HTTP_200_OK)
+async def research_stats():
+    """
+    研究服务统计：并发队列状态。
+    """
+    from service.deep_research_v2.service import _queue_stats, _MAX_CONCURRENT_RESEARCH
+    return {
+        "max_concurrent": _MAX_CONCURRENT_RESEARCH,
+        "stats": _queue_stats,
+    }
+
+
+# ============ 优化 #3 (增强): Prometheus Metrics API ============
+
+@router.get("/metrics", status_code=HTTP_200_OK)
+async def prometheus_metrics():
+    """
+    Prometheus 指标暴露端点。
+    返回 Prometheus 文本格式，供 Prometheus scraper 抓取。
+    """
+    try:
+        from service.metrics import get_metrics
+        from fastapi.responses import Response
+        return Response(content=get_metrics().format_prometheus(), media_type="text/plain; version=0.0.4")
+    except ImportError:
+        try:
+            from app.service.metrics import get_metrics
+            from fastapi.responses import Response
+            return Response(content=get_metrics().format_prometheus(), media_type="text/plain; version=0.0.4")
+        except ImportError:
+            return {"error": "Metrics module not available"}
+
+
+# ============ 优化 #6: 多租户 API ============
+
+@router.get("/tenant/{user_id}", status_code=HTTP_200_OK)
+async def tenant_info(user_id: str):
+    """查看租户配置和今日用量摘要。"""
+    try:
+        from service.tenant_isolation import get_tenant_registry
+        registry = get_tenant_registry()
+        config = registry.get_or_create_config(user_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+        usage = registry.get_usage_summary(user_id, today)
+        return {
+            "user_id": user_id,
+            "config": {
+                "max_concurrent": config.max_concurrent,
+                "cost_limit_yuan": config.cost_limit_yuan,
+                "daily_cost_limit_yuan": config.daily_cost_limit_yuan,
+                "max_researches_per_day": config.max_researches_per_day,
+                "memory_enabled": config.memory_enabled,
+            },
+            "today_usage": usage,
+        }
+    except ImportError:
+        try:
+            from app.service.tenant_isolation import get_tenant_registry
+            registry = get_tenant_registry()
+            config = registry.get_or_create_config(user_id)
+            today = datetime.now().strftime("%Y-%m-%d")
+            usage = registry.get_usage_summary(user_id, today)
+            return {
+                "user_id": user_id,
+                "config": {
+                    "max_concurrent": config.max_concurrent,
+                    "cost_limit_yuan": config.cost_limit_yuan,
+                    "daily_cost_limit_yuan": config.daily_cost_limit_yuan,
+                    "max_researches_per_day": config.max_researches_per_day,
+                    "memory_enabled": config.memory_enabled,
+                },
+                "today_usage": usage,
+            }
+        except ImportError:
+            return {"error": "Tenant isolation module not available"}

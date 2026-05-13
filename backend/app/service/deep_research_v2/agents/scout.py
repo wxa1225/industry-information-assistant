@@ -36,15 +36,21 @@ except ImportError:
 
 # 本地知识库搜索依赖
 try:
+    from service.fact_filter import FactFilter
+    from service.research_tool_registry import create_default_registry, ResearchToolRegistry
     from service.milvus_service import MilvusService
     from service.embedding_service import generate_embedding
     MILVUS_AVAILABLE = True
 except ImportError:
     try:
+        from app.service.fact_filter import FactFilter
+        from app.service.research_tool_registry import create_default_registry, ResearchToolRegistry
         from app.service.milvus_service import MilvusService
         from app.service.embedding_service import generate_embedding
         MILVUS_AVAILABLE = True
     except ImportError:
+        FactFilter = None  # type: ignore
+        ResearchToolRegistry = None  # type: ignore
         MILVUS_AVAILABLE = False
 
 
@@ -182,7 +188,28 @@ URL: {url}
         )
         self.search_api_key = search_api_key
         self.search_cache: Dict[str, List] = {}
-        self.fact_fingerprints: Dict[str, str] = {}  # 事实指纹用于去重
+        self.fact_fingerprints: Dict[str, str] = {}  # 向后兼容
+
+        # 事实过滤器（三层去重：Hash → 语义 → 信息增益）
+        self.fact_filter = None
+        if FactFilter is not None:
+            # use_vector=True 时启用 embedding 语义去重（依赖 embedding_service）
+            self.fact_filter = FactFilter(use_vector=MILVUS_AVAILABLE)
+
+        # 研究工具注册表（动态工具感知与选择）
+        self.tool_registry = None
+        if ResearchToolRegistry is not None:
+            self.tool_registry = create_default_registry()
+            self.logger.info("Research tool registry initialized with default tools")
+
+            # 注册 Tushare 数据查询工具
+            self.tool_registry.register(
+                name="tushare_query",
+                display_name="Tushare 金融数据",
+                description="获取上市公司实时行情、财务指标、行业分类等结构化数据",
+                when_to_use="研究涉及特定上市公司时（如茅台、宁德时代），获取 PE、营收、净利润等精确数据",
+                cost_level="low",
+            )
 
         # 初始化本地知识库搜索服务
         self.milvus_service = None
@@ -326,23 +353,37 @@ URL: {url}
                 )
 
                 if analysis:
-                    # 添加新事实
-                    for fact in analysis.get("extracted_facts", []):
-                        content = fact.get("content", "")
-                        source_url = fact.get("source_url", "")
+                    # 使用 FactFilter 过滤（收集候选 → 批量过滤 → 添加通过的事实）
+                    raw_facts = analysis.get("extracted_facts", [])
+                    candidates = []
+                    for fact in raw_facts:
+                        candidates.append({
+                            "id": f"fact_{uuid.uuid4().hex[:8]}",
+                            "content": fact.get("content", ""),
+                            "source_url": fact.get("source_url", ""),
+                            "source_name": fact.get("source_name", ""),
+                            "source_type": fact.get("source_type", "news"),
+                            "credibility_score": fact.get("credibility_score", 0.5),
+                            "is_supplementary": True,
+                            "related_sections": [],
+                        })
 
-                        if not self._is_duplicate_fact(content, source_url):
-                            fact_entry = {
-                                "id": f"fact_{uuid.uuid4().hex[:8]}",
-                                "content": content,
-                                "source_url": source_url,
-                                "source_name": fact.get("source_name", ""),
-                                "source_type": fact.get("source_type", "news"),
-                                "credibility_score": fact.get("credibility_score", 0.5),
-                                "is_supplementary": True,  # 标记为补充搜索获得
-                                "related_sections": []
-                            }
-                            state["facts"].append(fact_entry)
+                    existing_facts = [
+                        {"id": f.get("id", ""), "content": f.get("content", ""),
+                         "source_url": f.get("source_url", ""), "source_name": f.get("source_name", "")}
+                        for f in state["facts"]
+                    ]
+
+                    if self.fact_filter:
+                        accepted, _ = self.fact_filter.batch_filter(candidates, existing_facts)
+                    else:
+                        accepted = []
+                        for c in candidates:
+                            if not self._is_duplicate_fact(c["content"], c["source_url"]):
+                                accepted.append(c)
+
+                    for fact in accepted:
+                        state["facts"].append(fact)
 
         # 清空待搜索列表
         state["pending_search_queries"] = []
@@ -505,11 +546,14 @@ URL: {url}
 }}
 ```"""
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是专业的信息提取专家，擅长从搜索结果中提取结构化信息。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         return self.parse_json_response(response)
@@ -554,80 +598,124 @@ URL: {url}
             "search_local": search_local
         })
 
+        # 动态工具选择：根据章节类型选择最合适的工具组合
+        selected_tools = await self._select_tools_for_section(state["query"], section)
+        self.add_message(state, "tool_selection", {
+            "agent": self.name,
+            "section": section_title,
+            "selected_tools": selected_tools,
+        })
+
         # 逐个执行搜索，每完成一个就发送事件（提升用户体验）
         all_results = []
         for i, query in enumerate(search_queries):
-            # 网络搜索
-            if search_web:
-                results = await self._execute_search(query)
-                all_results.extend(results)
+            # 根据工具注册表动态执行搜索（回退到配置标志）
+            tools_to_run = selected_tools if selected_tools else (
+                (["web_search"] if search_web else []) +
+                (["local_knowledge"] if search_local else [])
+            )
 
-                # 搜索完成后立即发送原始结果（让用户看到进度）
-                if results:
-                    self.add_message(state, "search_progress", {
-                        "agent": self.name,
-                        "query": query,
-                        "results_count": len(results),
-                        "total_so_far": len(all_results),
-                        "section": section_title,
-                        "progress": f"{i + 1}/{len(search_queries)}",
-                        "search_type": "web"
-                    })
+            for tool_name in tools_to_run:
+                if tool_name == "web_search":
+                    results = await self._execute_search(query)
+                    all_results.extend(results)
 
-                    # 立即发送搜索结果供前端展示
-                    search_results_for_ui = [
-                        {
-                            "id": f"sr_{uuid.uuid4().hex[:6]}",
-                            "title": r.get("title", "")[:80],
-                            "source": r.get("site_name", "未知来源"),
-                            "url": r.get("url", ""),
-                            "snippet": r.get("summary", "") or r.get("snippet", ""),
-                            "date": r.get("date", ""),
-                            "isLocal": False
-                        }
-                        for r in results[:5]  # 每次最多显示5条
-                    ]
-                    self.add_message(state, "search_results", {
-                        "results": search_results_for_ui,
-                        "isIncremental": True,
-                        "searchType": "web"
-                    })
+                    if results:
+                        self.add_message(state, "search_progress", {
+                            "agent": self.name,
+                            "query": query,
+                            "results_count": len(results),
+                            "total_so_far": len(all_results),
+                            "section": section_title,
+                            "progress": f"{i + 1}/{len(search_queries)}",
+                            "search_type": "web"
+                        })
 
-            # 本地知识库搜索
-            if search_local:
-                local_results = await self._execute_local_search(query)
-                all_results.extend(local_results)
+                        search_results_for_ui = [
+                            {
+                                "id": f"sr_{uuid.uuid4().hex[:6]}",
+                                "title": r.get("title", "")[:80],
+                                "source": r.get("site_name", "未知来源"),
+                                "url": r.get("url", ""),
+                                "snippet": r.get("summary", "") or r.get("snippet", ""),
+                                "date": r.get("date", ""),
+                                "isLocal": False
+                            }
+                            for r in results[:5]
+                        ]
+                        self.add_message(state, "search_results", {
+                            "results": search_results_for_ui,
+                            "isIncremental": True,
+                            "searchType": "web"
+                        })
 
-                if local_results:
-                    self.add_message(state, "search_progress", {
-                        "agent": self.name,
-                        "query": query,
-                        "results_count": len(local_results),
-                        "total_so_far": len(all_results),
-                        "section": section_title,
-                        "progress": f"{i + 1}/{len(search_queries)}",
-                        "search_type": "local"
-                    })
+                elif tool_name == "local_knowledge":
+                    local_results = await self._execute_local_search(query)
+                    all_results.extend(local_results)
 
-                    # 发送本地搜索结果
-                    local_results_for_ui = [
-                        {
-                            "id": f"lr_{uuid.uuid4().hex[:6]}",
-                            "title": r.get("title", "")[:80],
-                            "source": "本地知识库",
-                            "url": r.get("url", ""),
-                            "snippet": r.get("summary", "") or r.get("snippet", ""),
-                            "date": "",
-                            "isLocal": True,
-                            "score": r.get("score", 0)
-                        }
-                        for r in local_results[:5]
-                    ]
-                    self.add_message(state, "search_results", {
-                        "results": local_results_for_ui,
-                        "isIncremental": True,
-                        "searchType": "local"
-                    })
+                    if local_results:
+                        self.add_message(state, "search_progress", {
+                            "agent": self.name,
+                            "query": query,
+                            "results_count": len(local_results),
+                            "total_so_far": len(all_results),
+                            "section": section_title,
+                            "progress": f"{i + 1}/{len(search_queries)}",
+                            "search_type": "local"
+                        })
+
+                        local_results_for_ui = [
+                            {
+                                "id": f"lr_{uuid.uuid4().hex[:6]}",
+                                "title": r.get("title", "")[:80],
+                                "source": "本地知识库",
+                                "url": r.get("url", ""),
+                                "snippet": r.get("summary", "") or r.get("snippet", ""),
+                                "date": "",
+                                "isLocal": True,
+                                "score": r.get("score", 0)
+                            }
+                            for r in local_results[:5]
+                        ]
+                        self.add_message(state, "search_results", {
+                            "results": local_results_for_ui,
+                            "isIncremental": True,
+                            "searchType": "local"
+                        })
+
+                elif tool_name == "tushare_query":
+                    tushare_results = await self._execute_tushare_query(query)
+                    all_results.extend(tushare_results)
+
+                    if tushare_results:
+                        self.add_message(state, "search_progress", {
+                            "agent": self.name,
+                            "query": query,
+                            "results_count": len(tushare_results),
+                            "total_so_far": len(all_results),
+                            "section": section_title,
+                            "progress": f"{i + 1}/{len(search_queries)}",
+                            "search_type": "tushare"
+                        })
+
+                        tushare_results_for_ui = [
+                            {
+                                "id": f"tr_{uuid.uuid4().hex[:6]}",
+                                "title": r.get("title", "")[:80],
+                                "source": "Tushare 金融数据",
+                                "url": r.get("url", ""),
+                                "snippet": r.get("summary", "")[:200],
+                                "date": r.get("date", ""),
+                                "isLocal": False,
+                                "isStructured": True,
+                            }
+                            for r in tushare_results[:5]
+                        ]
+                        self.add_message(state, "search_results", {
+                            "results": tushare_results_for_ui,
+                            "isIncremental": True,
+                            "searchType": "tushare"
+                        })
 
         if not all_results:
             self.logger.warning(f"No search results for section: {section_title}")
@@ -647,22 +735,14 @@ URL: {url}
         )
 
         if analysis:
-            # 提取事实（带去重）
-            added_facts = 0
-            duplicate_facts = 0
-            for fact in analysis.get("extracted_facts", []):
-                content = fact.get("content", "")
-                source_url = fact.get("source_url", "")
-
-                # 去重检查
-                if self._is_duplicate_fact(content, source_url):
-                    duplicate_facts += 1
-                    continue
-
-                fact_entry = {
+            # 提取事实（使用 FactFilter 三层去重 pipeline）
+            raw_facts = analysis.get("extracted_facts", [])
+            candidates = []
+            for fact in raw_facts:
+                candidates.append({
                     "id": f"fact_{uuid.uuid4().hex[:8]}",
-                    "content": content,
-                    "source_url": source_url,
+                    "content": fact.get("content", ""),
+                    "source_url": fact.get("source_url", ""),
                     "source_name": fact.get("source_name", ""),
                     "source_type": fact.get("source_type", "news"),
                     "credibility_score": fact.get("credibility_score", 0.5),
@@ -671,13 +751,39 @@ URL: {url}
                     "verified": False,
                     "related_hypothesis": fact.get("related_hypothesis"),
                     "hypothesis_support": fact.get("hypothesis_support"),
-                    "metadata": {}
-                }
-                state["facts"].append(fact_entry)
+                    "metadata": {},
+                    "_raw": fact,  # 保留原始数据用于数据点提取
+                })
+
+            existing_facts = [
+                {"id": f.get("id", ""), "content": f.get("content", ""),
+                 "source_url": f.get("source_url", ""), "source_name": f.get("source_name", "")}
+                for f in state["facts"]
+            ]
+
+            # 使用 FactFilter 批量过滤
+            if self.fact_filter:
+                accepted_facts, filter_results = self.fact_filter.batch_filter(
+                    candidates, existing_facts
+                )
+                rejected_count = len(candidates) - len(accepted_facts)
+            else:
+                # 回退到旧版 Hash 去重
+                accepted_facts = []
+                rejected_count = 0
+                for c in candidates:
+                    if not self._is_duplicate_fact(c["content"], c["source_url"]):
+                        accepted_facts.append(c)
+
+            # 添加通过过滤的事实到 state
+            added_facts = 0
+            for fact in accepted_facts:
+                raw = fact.pop("_raw", {})
+                state["facts"].append(fact)
                 added_facts += 1
 
                 # 提取数据点
-                for dp in fact.get("data_points", []):
+                for dp in raw.get("data_points", []):
                     data_point = {
                         "id": f"dp_{uuid.uuid4().hex[:8]}",
                         "name": dp.get("name", ""),
@@ -689,8 +795,8 @@ URL: {url}
                     }
                     state["data_points"].append(data_point)
 
-            if duplicate_facts > 0:
-                self.logger.info(f"Deduplicated {duplicate_facts} facts, added {added_facts}")
+            if rejected_count > 0:
+                self.logger.info(f"FactFilter: {rejected_count} rejected, {added_facts} accepted for section '{section_title}'")
 
             # 更新知识图谱
             entities = analysis.get("entities_discovered", [])
@@ -735,7 +841,7 @@ URL: {url}
                 "agent": self.name,
                 "section": section_title,
                 "facts_count": added_facts,
-                "duplicates_removed": duplicate_facts,
+                "duplicates_removed": rejected_count,
                 "data_points_count": len(extracted_data_points),
                 "insights": analysis.get("key_insights", [])[:3],
                 "source_quality": analysis.get("source_quality_assessment", ""),
@@ -872,37 +978,54 @@ URL: {url}
             if not analysis:
                 continue
 
-            # 提取并添加事实
-            added_facts = 0
-            for fact in analysis.get("extracted_facts", []):
-                content = fact.get("content", "")
-                source_url = fact.get("source_url", "")
+            # 提取并添加事实（使用 FactFilter 过滤）
+            raw_facts = analysis.get("extracted_facts", [])
+            candidates = []
+            for fact in raw_facts:
+                candidates.append({
+                    "id": f"fact_{uuid.uuid4().hex[:8]}",
+                    "content": fact.get("content", ""),
+                    "source_url": fact.get("source_url", ""),
+                    "source_name": fact.get("source_name", ""),
+                    "source_type": fact.get("source_type", "news"),
+                    "credibility_score": fact.get("credibility_score", 0.5),
+                    "related_sections": [section_id],
+                    "search_depth": depth,
+                    "search_type": search_type,
+                    "_raw": fact,
+                })
 
-                if not self._is_duplicate_fact(content, source_url):
-                    fact_entry = {
-                        "id": f"fact_{uuid.uuid4().hex[:8]}",
-                        "content": content,
-                        "source_url": source_url,
-                        "source_name": fact.get("source_name", ""),
-                        "source_type": fact.get("source_type", "news"),
-                        "credibility_score": fact.get("credibility_score", 0.5),
-                        "related_sections": [section_id],
-                        "search_depth": depth,
-                        "search_type": search_type
-                    }
-                    state["facts"].append(fact_entry)
-                    added_facts += 1
+            existing_facts = [
+                {"id": f.get("id", ""), "content": f.get("content", ""),
+                 "source_url": f.get("source_url", ""), "source_name": f.get("source_name", "")}
+                for f in state["facts"]
+            ]
 
-                    # 更新假设证据（如果有）
-                    hypothesis_support = fact.get("hypothesis_support")
-                    if hypothesis_support and fact.get("related_hypothesis"):
-                        h_id = fact["related_hypothesis"]
-                        for h in state.get("hypotheses", []):
-                            if h.get("id") == h_id:
-                                if hypothesis_support == "supports":
-                                    h.setdefault("evidence_for", []).append(content[:100])
-                                elif hypothesis_support == "refutes":
-                                    h.setdefault("evidence_against", []).append(content[:100])
+            if self.fact_filter:
+                accepted_facts, _ = self.fact_filter.batch_filter(candidates, existing_facts)
+                added_facts = len(accepted_facts)
+            else:
+                accepted_facts = []
+                added_facts = 0
+                for c in candidates:
+                    if not self._is_duplicate_fact(c["content"], c["source_url"]):
+                        accepted_facts.append(c)
+                        added_facts += 1
+
+            for fact in accepted_facts:
+                raw = fact.pop("_raw", {})
+                state["facts"].append(fact)
+
+                # 更新假设证据（如果有）
+                hypothesis_support = raw.get("hypothesis_support")
+                if hypothesis_support and raw.get("related_hypothesis"):
+                    h_id = raw["related_hypothesis"]
+                    for h in state.get("hypotheses", []):
+                        if h.get("id") == h_id:
+                            if hypothesis_support == "supports":
+                                h.setdefault("evidence_for", []).append(fact["content"][:100])
+                            elif hypothesis_support == "refutes":
+                                h.setdefault("evidence_against", []).append(fact["content"][:100])
 
             # 提取数据点
             for dp in analysis.get("data_points", []):
@@ -993,11 +1116,14 @@ URL: {url}
 }}
 ```"""
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是专业的信息验证专家，擅长从搜索结果中提取权威信息并追溯原始来源。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         return self.parse_json_response(response)
@@ -1056,6 +1182,83 @@ URL: {url}
         except Exception as e:
             self.logger.error(f"Local search error for '{query}': {e}")
             return []
+
+    async def _execute_tushare_query(self, query: str) -> List[Dict]:
+        """
+        执行 Tushare 金融数据查询（优化 #4）
+
+        自动识别查询中的公司名，获取行情+财务数据。
+
+        Args:
+            query: 搜索查询（应包含公司名或股票代码）
+
+        Returns:
+            结构化数据结果列表
+        """
+        try:
+            from service.tushare_service import (
+                query_company_comprehensive, convert_to_ts_code
+            )
+            from config.stock_mapping import find_company_in_query
+        except ImportError:
+            try:
+                from app.service.tushare_service import (
+                    query_company_comprehensive, convert_to_ts_code
+                )
+                from app.config.stock_mapping import find_company_in_query
+            except ImportError:
+                self.logger.warning("Tushare service or stock mapping not available")
+                return []
+
+        results = []
+
+        # 从查询中识别公司
+        companies = find_company_in_query(query)
+        if not companies:
+            return []
+
+        for company_name, stock_code in companies[:2]:
+            self.logger.info(f"[Tushare] Querying data for {company_name} ({stock_code})")
+
+            ts_code = convert_to_ts_code(stock_code)
+            data = await query_company_comprehensive(ts_code)
+
+            if data.get("success"):
+                inner = data.get("data", {})
+
+                # 构建行情数据展示
+                quote = inner.get("daily_quote", {})
+                basic = inner.get("daily_basic", {})
+                company = inner.get("company_info", {})
+
+                display_parts = [f"{company_name}（{ts_code}）综合数据"]
+
+                if quote:
+                    display_parts.append(f"收盘价: {quote.get('close', 'N/A')}")
+                    display_parts.append(f"涨跌幅: {quote.get('pct_chg', 'N/A')}%")
+
+                if basic:
+                    display_parts.append(f"PE(TTM): {basic.get('pe_ttm', 'N/A')}")
+                    display_parts.append(f"PB: {basic.get('pb', 'N/A')}")
+                    display_parts.append(f"总市值: {basic.get('total_mv', 'N/A')}元")
+
+                results.append({
+                    'url': f"tushare://company/{ts_code}",
+                    'title': f"{company_name}（{ts_code}）实时行情与指标",
+                    'summary': " | ".join(display_parts),
+                    'snippet': " | ".join(display_parts),
+                    'site_name': "Tushare 金融数据",
+                    'date': datetime.now().isoformat()[:10],
+                    'is_tushare': True,
+                    'structured_data': data,
+                })
+
+                # 添加数据点到 state（后续会被提取）
+                self.logger.info(f"[Tushare] Retrieved data for {company_name}: {display_parts}")
+            else:
+                self.logger.warning(f"[Tushare] Failed to retrieve data for {company_name}: {data.get('error')}")
+
+        return results
 
     async def _execute_search(self, query: str, count: int = 10) -> List[Dict]:
         """执行网络搜索 - 使用 Bocha Web Search API"""
@@ -1163,11 +1366,14 @@ URL: {r.get('url', '')}
             search_results="\n".join(formatted_results)
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
         response = await self.call_llm(
             system_prompt="你是专业的研究分析师，擅长从搜索结果中提取结构化信息、验证假设并评估来源质量。",
             user_prompt=prompt,
             json_mode=True,
-            temperature=0.2
+            temperature=0.2,
+            context_layers=context_layers,
         )
 
         return self.parse_json_response(response)
@@ -1306,6 +1512,82 @@ URL: {r.get('url', '')}
 
         self.logger.debug(f"Regex extracted {len(text)} chars from {url}")
         return text[:max_length]
+
+    async def _select_tools_for_section(
+        self,
+        query: str,
+        section: Dict,
+    ) -> List[str]:
+        """
+        根据章节类型和研究问题，动态选择最适合的工具组合。
+
+        Returns:
+            选中的工具名称列表
+        """
+        if not self.tool_registry:
+            return ["web_search"]  # 回退：只做网络搜索
+
+        if not self.tool_registry.get_enabled_tools():
+            return ["web_search"]
+
+        # 渐进式披露：使用精简工具描述进行选择
+        tool_metadata = self.tool_registry.get_tool_metadata_light()
+        prompt = f"""你是一个研究工具选择器。根据以下研究任务，从可用工具中选择最合适的工具组合。
+
+## 研究任务
+章节标题: {section.get('title', '')}
+章节描述: {section.get('description', '')}
+章节类型: {section.get('section_type', 'mixed')}
+研究问题: {query}
+
+## 可用工具
+{tool_metadata}
+
+## 输出格式
+```json
+{{
+    "selected_tools": ["tool_name_1", "tool_name_2"],
+    "reason": "选择这些工具的原因"
+}}
+```
+
+注意：
+1. 选择 1-3 个最适合的工具
+2. 不要选择未启用的工具
+3. 如果只需要一个工具就足够，不要选多个"""
+
+        try:
+            # Prefix Caching 友好：使用四层上下文
+            context_layers = self.build_context_layers(state)
+            response = await self.call_llm(
+                system_prompt="你是研究工具选择器，根据任务特点选择最合适的工具组合。",
+                user_prompt=prompt,
+                json_mode=True,
+                temperature=0.1,
+                context_layers=context_layers,
+            )
+
+            result = self.parse_json_response(response)
+            selected = result.get("selected_tools", []) if result else []
+
+            # 验证选中的工具确实存在且已启用
+            valid_tools = []
+            for tool_name in selected:
+                tool = self.tool_registry.get_tool(tool_name)
+                if tool and tool.enabled:
+                    valid_tools.append(tool_name)
+
+            if valid_tools:
+                self.logger.info(
+                    f"[ToolSelection] {section.get('title', '?')}: "
+                    f"{', '.join(valid_tools)} (reason: {result.get('reason', '')})"
+                )
+                return valid_tools
+        except Exception as e:
+            self.logger.warning(f"[ToolSelection] 工具选择失败: {e}")
+
+        # 回退：使用默认工具
+        return ["web_search"]
 
     def _compute_fact_fingerprint(self, content: str) -> str:
         """计算事实的语义指纹用于去重"""

@@ -624,6 +624,20 @@ export default function Index() {
                 }))
               }
 
+              // 保存交叉验证结果
+              if (json.conflict_report) {
+                target.conflictReport = json.conflict_report
+                console.log(`[前端] research_complete: ✅ 交叉验证结果已保存`)
+                // 同时存储到研究详情中
+                const writingType = researchDetailsRef.current.has('writing') ? 'writing' : 'generating'
+                const detail = researchDetailsRef.current.get(writingType)
+                if (detail) {
+                  detail.conflictReport = json.conflict_report
+                  setSelectedResearchDetail({ ...detail })
+                  setResearchDataVersion(v => v + 1)
+                }
+              }
+
               // 标记所有研究步骤为完成
               setResearchSteps(prev => prev.map(s => ({ ...s, status: 'completed' as const })))
               // 确保触发重新计算
@@ -1528,6 +1542,7 @@ export default function Index() {
     let allCharts: ResearchDetailData['charts'] = []
     let streamingReport = ''
     let allSections: ResearchDetailData['sections'] = []
+    let conflictReport: ResearchDetailData['conflictReport'] = null
 
     researchDetailsRef.current.forEach((detail, stepId) => {
       console.log(`[前端] 聚合步骤 ${stepId}: searchResults=${detail.searchResults?.length || 0}, charts=${detail.charts?.length || 0}, hasGraph=${!!detail.knowledgeGraph}, hasReport=${!!detail.streamingReport}, sections=${detail.sections?.length || 0}`)
@@ -1552,9 +1567,13 @@ export default function Index() {
       if (detail.sections && detail.sections.length > 0) {
         allSections = [...allSections!, ...detail.sections]
       }
+      // 取最新的交叉验证结果
+      if (detail.conflictReport) {
+        conflictReport = detail.conflictReport
+      }
     })
 
-    console.log(`[前端] 聚合结果: searchResults=${allSearchResults.length}, charts=${allCharts.length}, hasGraph=${!!knowledgeGraph}, hasReport=${!!streamingReport}, sections=${allSections.length}`)
+    console.log(`[前端] 聚合结果: searchResults=${allSearchResults.length}, charts=${allCharts.length}, hasGraph=${!!knowledgeGraph}, hasReport=${!!streamingReport}, sections=${allSections.length}, hasConflictReport=${!!conflictReport}`)
 
     // 创建聚合的数据对象
     const aggregated: ResearchDetailData = {
@@ -1567,6 +1586,7 @@ export default function Index() {
       charts: allCharts,
       streamingReport,
       sections: allSections,
+      conflictReport,
     }
 
     return aggregated

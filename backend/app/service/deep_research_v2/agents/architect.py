@@ -190,17 +190,33 @@ class ChiefArchitect(BaseAgent):
         })
 
         # 调用LLM生成规划 - 带重试机制
-        prompt = self.PLANNING_PROMPT.format(query=state["query"])
         result = None
         max_retries = 2
 
         for attempt in range(max_retries + 1):
+            # Prefix Caching 友好：使用四层上下文
+            context_layers = self.build_context_layers(state)
+
+            user_prompt = self.PLANNING_PROMPT.format(query=state["query"])
+            if attempt > 0:
+                # 重试时使用简化 prompt
+                user_prompt = f"""请为"{state['query']}"生成研究大纲。
+
+输出JSON格式：
+{{"outline": [
+    {{"id": "sec_1", "title": "章节标题", "description": "描述", "section_type": "mixed", "requires_data": true, "requires_chart": false, "search_queries": ["关键词1", "关键词2"]}},
+    ...更多章节(共5-8个)...
+], "research_questions": ["问题1", "问题2", "问题3"], "key_entities": []}}
+
+要求：outline必须包含5-8个章节，覆盖市场概况、企业竞争、技术趋势、政策环境、未来展望等方面。"""
+
             response = await self.call_llm(
                 system_prompt="你是一位专业的行业研究规划师。请严格按照要求的JSON格式输出，不要添加任何额外内容。",
-                user_prompt=prompt,
+                user_prompt=user_prompt,
                 json_mode=True,
                 temperature=0.3,
-                max_tokens=16000  # 拉满到最大值
+                max_tokens=16000,  # 拉满到最大值
+                context_layers=context_layers,
             )
 
             # Debug: 记录原始响应
@@ -224,19 +240,6 @@ class ChiefArchitect(BaseAgent):
                 self.logger.warning(f"Attempt {attempt + 1}: No 'outline' key in result. Keys: {list(result.keys())}")
             elif len(result.get("outline", [])) < 3:
                 self.logger.warning(f"Attempt {attempt + 1}: Outline too short: {len(result.get('outline', []))} sections")
-
-            if attempt < max_retries:
-                self.logger.warning(f"Outline generation failed or incomplete, retrying... (attempt {attempt + 1})")
-                # 简化提示词重试
-                prompt = f"""请为"{state['query']}"生成研究大纲。
-
-输出JSON格式：
-{{"outline": [
-    {{"id": "sec_1", "title": "章节标题", "description": "描述", "section_type": "mixed", "requires_data": true, "requires_chart": false, "search_queries": ["关键词1", "关键词2"]}},
-    ...更多章节(共5-8个)...
-], "research_questions": ["问题1", "问题2", "问题3"], "key_entities": []}}
-
-要求：outline必须包含5-8个章节，覆盖市场概况、企业竞争、技术趋势、政策环境、未来展望等方面。"""
 
         if not result:
             state["errors"].append("Failed to generate research plan after retries")
@@ -334,10 +337,14 @@ class ChiefArchitect(BaseAgent):
             data_points_count=len(state["data_points"])
         )
 
+        # Prefix Caching 友好：使用四层上下文
+        context_layers = self.build_context_layers(state)
+
         response = await self.call_llm(
             system_prompt="你是总架构师，需要判断是否需要调整研究计划。",
             user_prompt=prompt,
-            json_mode=True
+            json_mode=True,
+            context_layers=context_layers,
         )
 
         result = self.parse_json_response(response)

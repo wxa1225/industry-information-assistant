@@ -13,6 +13,9 @@ from alibabacloud_tea_util import models as util_models
 
 from service.embedding_service import generate_embedding
 from service.milvus_service import get_milvus_service
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DocMindService:
@@ -56,12 +59,12 @@ class DocMindService:
 
             if response.body and response.body.data:
                 task_id = response.body.data.id
-                print(f"任务已提交，任务ID: {task_id}")
+                logger.debug(f"任务已提交，任务ID: {task_id}")
                 return task_id
             return None
 
         except Exception as e:
-            print(f"提交任务失败: {e}")
+            logger.debug(f"提交任务失败: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -83,7 +86,7 @@ class DocMindService:
                 return response.body.data.to_map()
             return None
         except Exception as e:
-            print(f"查询状态失败: {e}")
+            logger.debug(f"查询状态失败: {e}")
             return None
 
     def wait_for_completion(self, task_id: str, poll_interval: int = 5, max_wait: int = 300) -> bool:
@@ -98,29 +101,29 @@ class DocMindService:
         Returns:
             任务是否成功完成
         """
-        print("开始轮询任务状态...")
+        logger.debug("开始轮询任务状态...")
         start_time = time.time()
 
         while time.time() - start_time < max_wait:
             status_data = self.query_status(task_id)
             if not status_data:
-                print("查询状态失败")
+                logger.debug("查询状态失败")
                 return False
 
             status = status_data.get('Status', '').lower()
-            print(f"当前状态: {status}")
+            logger.debug(f"当前状态: {status}")
 
             if status == 'success':
-                print("任务已成功完成")
+                logger.debug("任务已成功完成")
                 return True
             elif status == 'failed':
-                print("任务执行失败")
+                logger.debug("任务执行失败")
                 return False
             else:
                 # 任务仍在处理中
                 time.sleep(poll_interval)
 
-        print("等待超时")
+        logger.debug("等待超时")
         return False
 
     def get_result(self, task_id: str, layout_num: int = 0, layout_step_size: int = 10) -> Optional[Any]:
@@ -144,7 +147,7 @@ class DocMindService:
             response = self.client.get_doc_parser_result(request)
             return response.body.data if response.body.data else None
         except Exception as e:
-            print(f"获取结果失败: {e}")
+            logger.debug(f"获取结果失败: {e}")
             return None
 
     def collect_all_results(self, task_id: str, layout_step_size: int = 10) -> str:
@@ -176,7 +179,7 @@ class DocMindService:
             if not layouts:
                 break
 
-            print(f"获取到 {len(layouts)} 个布局块 (从 {layout_num} 开始)")
+            logger.debug(f"获取到 {len(layouts)} 个布局块 (从 {layout_num} 开始)")
 
             # 提取文本
             for layout in layouts:
@@ -268,7 +271,7 @@ def process_document_with_docmind(
     }
 
     try:
-        print(f"开始处理文档: {file_name}")
+        logger.debug(f"开始处理文档: {file_name}")
 
         # 1. 初始化服务并提交任务
         service = DocMindService()
@@ -276,51 +279,51 @@ def process_document_with_docmind(
 
         if not task_id:
             result["message"] = "文档提交失败"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
         # 2. 等待任务完成
         if not service.wait_for_completion(task_id):
             result["message"] = "文档解析任务失败或超时"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
         # 3. 收集解析结果
-        print("开始收集解析结果...")
+        logger.debug("开始收集解析结果...")
         text = service.collect_all_results(task_id)
 
         if not text or not text.strip():
             result["message"] = "文档内容为空"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
-        print(f"解析到文本长度: {len(text)}")
+        logger.debug(f"解析到文本长度: {len(text)}")
 
         # 4. 文本切分
         chunks = chunk_text(text, chunk_size=chunk_size)
 
         if not chunks:
             result["message"] = "文档切分失败"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
-        print(f"文档切分完成，共 {len(chunks)} 个切片")
+        logger.debug(f"文档切分完成，共 {len(chunks)} 个切片")
 
         # 5. 生成向量嵌入
-        print("开始生成向量嵌入...")
+        logger.debug("开始生成向量嵌入...")
         embeddings = generate_embedding(chunks)
 
         if not embeddings:
             result["message"] = "向量生成失败: 返回为空"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
         if len(embeddings) != len(chunks):
             result["message"] = f"向量生成失败: 数量不匹配 ({len(embeddings)} vs {len(chunks)})"
-            print(result["message"])
+            logger.info(result["message"])
             return result
 
-        print(f"向量生成完成，维度: {len(embeddings[0])}")
+        logger.debug(f"向量生成完成，维度: {len(embeddings[0])}")
 
         # 6. 构建 Milvus 文档
         doc_id = hashlib.md5(file_name.encode()).hexdigest()
@@ -341,7 +344,7 @@ def process_document_with_docmind(
             documents.append(doc)
 
         # 7. 插入 Milvus
-        print(f"开始插入 Milvus，集合: {index_name}")
+        logger.debug(f"开始插入 Milvus，集合: {index_name}")
         milvus = get_milvus_service()
         milvus.insert_documents(index_name, documents)
 
@@ -349,11 +352,11 @@ def process_document_with_docmind(
         result["message"] = f"成功处理 {len(documents)} 个切片"
         result["document_count"] = len(documents)
 
-        print(f"文档处理完成: {result['message']}")
+        logger.debug(f"文档处理完成: {result['message']}")
 
     except Exception as e:
         result["message"] = f"处理失败: {str(e)}"
-        print(f"文档处理异常: {e}")
+        logger.debug(f"文档处理异常: {e}")
         import traceback
         traceback.print_exc()
 

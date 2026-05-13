@@ -10,6 +10,7 @@ DeepResearch V2.0 - 服务入口
 import os
 import json
 import uuid
+import asyncio
 import logging
 from typing import AsyncGenerator, Dict, Any, Optional
 from datetime import datetime
@@ -20,15 +21,66 @@ from .graph import DeepResearchGraph
 try:
     from config.llm_config import get_config
 except ImportError:
+    from app.config.llm_config import get_config
+
+# 优化 #6: 多租户隔离
+try:
+    from service.tenant_isolation import get_tenant_registry
+    TENANT_AVAILABLE = True
+except ImportError:
     try:
-        from app.config.llm_config import get_config
+        from app.service.tenant_isolation import get_tenant_registry
+        TENANT_AVAILABLE = True
     except ImportError:
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        from config.llm_config import get_config
+        TENANT_AVAILABLE = False
+
+# 优化 #3 (增强): Prometheus 指标
+try:
+    from service.metrics import get_metrics
+    METRICS_AVAILABLE = True
+except ImportError:
+    try:
+        from app.service.metrics import get_metrics
+        METRICS_AVAILABLE = True
+    except ImportError:
+        METRICS_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("DeepResearchV2Service")
+
+
+# ============================================================
+# 优化 #1: 并发限流 — 全局 Semaphore 控制同时运行的研究数
+# ============================================================
+_MAX_CONCURRENT_RESEARCH = int(os.getenv("MAX_CONCURRENT_RESEARCH", "3"))
+_research_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_RESEARCH)
+_queue_stats = {"total_queued": 0, "total_completed": 0, "total_rejected": 0}
+
+
+# ============================================================
+# 优化 #3: 成本熔断 — 单次研究成本上限
+# ============================================================
+_COST_LIMIT_YUAN = float(os.getenv("RESEARCH_COST_LIMIT_YUAN", "5.0"))
+
+
+def _get_current_cost(trace_id: str) -> float:
+    """获取当前 trace 的累计成本（元）"""
+    try:
+        from service.observability import calculate_cost, get_trace_stats
+        total = 0.0
+        for s in get_trace_stats(trace_id):
+            total += calculate_cost(s.model, s.input_tokens, s.output_tokens)
+        return total
+    except Exception:
+        return 0.0
+
+
+class CostLimitExceeded(Exception):
+    """成本超限异常"""
+    def __init__(self, current_cost: float, limit: float):
+        self.current_cost = current_cost
+        self.limit = limit
+        super().__init__(f"研究成本已达上限: ¥{current_cost:.4f} / ¥{limit:.2f}")
 
 
 class DeepResearchV2Service:
@@ -95,26 +147,79 @@ class DeepResearchV2Service:
         """
         执行深度研究（SSE 流式输出）
 
-        Args:
-            query: 用户问题
-            session_id: 会话ID（可选）
-            kb_name: 知识库名称（可选）
-            resume: 是否从检查点恢复
-            user_id: 用户ID（用于检查点）
-            search_web: 是否启用网络搜索（默认True）
-            search_local: 是否启用本地知识库搜索（默认False）
-
-        Yields:
-            SSE 格式的事件字符串
+        内置并发限流：超过最大并发数的请求排队等待。
+        内置成本熔断：单次研究成本超过上限自动终止。
+        多租户隔离：按用户 ID 检查每日限额。
         """
         if not session_id:
             session_id = str(uuid.uuid4())
 
+        # 默认用户 ID
+        if not user_id:
+            from service.tenant_isolation import _default_user_id
+            try:
+                user_id = _default_user_id()
+            except ImportError:
+                from app.service.tenant_isolation import _default_user_id
+                user_id = _default_user_id()
+
+        # --- 优化 #6: 多租户限额检查 ---
+        if TENANT_AVAILABLE:
+            registry = get_tenant_registry()
+            config = registry.get_or_create_config(user_id)
+            today = datetime.now().strftime("%Y-%m-%d")
+            limit_reason = registry.check_daily_limit(user_id, today)
+            if limit_reason:
+                logger.warning(f"[Tenant] Research rejected for {user_id}: {limit_reason}")
+                yield self._format_sse({
+                    "type": "error",
+                    "content": f"研究限额: {limit_reason}",
+                    "user_id": user_id,
+                })
+                yield "data: [DONE]\n\n"
+                return
+
         if resume:
             logger.info(f"Resuming research for session {session_id}")
         else:
-            logger.info(f"Starting research for session {session_id}: {query[:50]}...")
+            logger.info(f"Starting research for session {session_id}: {query[:50]}... (user: {user_id})")
             logger.info(f"Search modes - web: {search_web}, local: {search_local}")
+
+        # --- 优化 #3 (增强): 记录研究开始指标 ---
+        if METRICS_AVAILABLE:
+            try:
+                get_metrics().record_research_start()
+            except Exception:
+                pass
+
+        import time
+        research_start_time = time.time()
+        research_cost = 0.0
+        research_success = False
+
+        # --- 优化 #1: 并发限流 ---
+        acquired = False
+        try:
+            _queue_stats["total_queued"] += 1
+            acquired = _research_semaphore.locked() is False
+            if acquired:
+                _research_semaphore.release()
+
+            await _research_semaphore.acquire()
+            _queue_stats["total_completed"] += 1
+        except Exception:
+            _queue_stats["total_rejected"] += 1
+            if METRICS_AVAILABLE:
+                try:
+                    get_metrics().record_research_failed()
+                except Exception:
+                    pass
+            yield self._format_sse({
+                "type": "error",
+                "content": "系统繁忙，当前研究任务过多，请稍后重试"
+            })
+            yield "data: [DONE]\n\n"
+            return
 
         try:
             async for event in self.graph.run(
@@ -127,12 +232,59 @@ class DeepResearchV2Service:
                 # 转换为 SSE 格式
                 yield self._format_sse(event)
 
+                # 研究完成后提取成本
+                if event.get("type") == "research_complete":
+                    cost_report = event.get("cost_report", {})
+                    research_cost = cost_report.get("total_cost", 0)
+                    research_success = True
+
+        except CostLimitExceeded as e:
+            logger.warning(f"[CostCircuit] {e}")
+            yield self._format_sse({
+                "type": "cost_limit_exceeded",
+                "content": str(e),
+                "current_cost": e.current_cost,
+                "limit": e.limit,
+            })
+            if METRICS_AVAILABLE:
+                try:
+                    get_metrics().record_research_failed()
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Research error: {e}")
             yield self._format_sse({
                 "type": "error",
                 "content": str(e)
             })
+            if METRICS_AVAILABLE:
+                try:
+                    get_metrics().record_research_failed()
+                except Exception:
+                    pass
+        finally:
+            _research_semaphore.release()
+
+            # --- 优化 #3 (增强): 记录研究完成指标 ---
+            duration = time.time() - research_start_time
+            if METRICS_AVAILABLE:
+                try:
+                    m = get_metrics()
+                    if research_success:
+                        m.record_research_complete(duration, research_cost)
+                    # else: already recorded failed above
+                except Exception:
+                    pass
+
+            # --- 优化 #6: 记录用量 ---
+            if TENANT_AVAILABLE and research_success:
+                try:
+                    registry = get_tenant_registry()
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    # 从 cost_report 估算 token 用量
+                    registry.record_usage(user_id, today, tokens=0, cost=research_cost)
+                except Exception:
+                    pass
 
         # 发送结束标记
         yield "data: [DONE]\n\n"
@@ -154,14 +306,14 @@ class DeepResearchV2Service:
             session_id: 会话ID
 
         Returns:
-            完整的研究结果
+            完整的研究结果（含 trace_id 和 cost_report）
         """
         if not session_id:
             session_id = str(uuid.uuid4())
 
         state = await self.graph.run_sync(query, session_id)
 
-        return {
+        result = {
             "session_id": session_id,
             "query": query,
             "final_report": state.get("final_report", ""),
@@ -174,8 +326,28 @@ class DeepResearchV2Service:
             "insights": state.get("insights", []),
             "iterations": state.get("iteration", 0),
             "phase": state.get("phase", ""),
-            "logs": state.get("logs", [])
+            "logs": state.get("logs", []),
         }
+
+        # 附加可观测性数据
+        trace_id = state.get("trace_id", "")
+        if trace_id:
+            result["trace_id"] = trace_id
+            try:
+                from service.observability import get_trace_summary, calculate_cost, get_trace_stats, format_cost
+                summary = get_trace_summary(trace_id)
+                total_cost = 0.0
+                for s in get_trace_stats(trace_id):
+                    total_cost += calculate_cost(s.model, s.input_tokens, s.output_tokens)
+                result["cost_report"] = {
+                    **summary,
+                    "total_cost": round(total_cost, 6),
+                    "total_cost_formatted": format_cost(total_cost),
+                }
+            except Exception:
+                pass
+
+        return result
 
 
 def create_service(

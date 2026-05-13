@@ -7,6 +7,9 @@ import httpx
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class StockMarket(Enum):
@@ -85,7 +88,7 @@ class StockService:
     def __init__(self):
         self.api_key = os.getenv("JUHE_STOCK_API_KEY", "")
         if not self.api_key:
-            print("警告: JUHE_STOCK_API_KEY 环境变量未设置")
+            logger.debug("警告: JUHE_STOCK_API_KEY 环境变量未设置")
 
     async def get_stock_by_code(self, stock_code: str) -> Dict[str, Any]:
         """

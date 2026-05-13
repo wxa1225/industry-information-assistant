@@ -18,6 +18,9 @@ from llama_index.core.schema import NodeWithScore
 from llama_index.postprocessor.dashscope_rerank import DashScopeRerank
 
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 
@@ -49,13 +52,13 @@ def generate_embedding(
     base_url = base_url or os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
     if not api_key:
-        print("错误: 缺少 DASHSCOPE_API_KEY 环境变量")
+        logger.debug("错误: 缺少 DASHSCOPE_API_KEY 环境变量")
         return None
 
     try:
         client = OpenAI(api_key=api_key, base_url=base_url)
     except Exception as e:
-        print(f"初始化 OpenAI 客户端失败: {e}")
+        logger.debug(f"初始化 OpenAI 客户端失败: {e}")
         return None
 
     # 单个文本
@@ -69,7 +72,7 @@ def generate_embedding(
             )
             return completion.data[0].embedding
         except Exception as e:
-            print(f"Embedding 请求失败: {e}")
+            logger.debug(f"Embedding 请求失败: {e}")
             return None
 
     # 文本列表 - 分批处理
@@ -89,7 +92,7 @@ def generate_embedding(
                 batch_embeddings = [item.embedding for item in completion.data]
                 all_embeddings.extend(batch_embeddings)
             except Exception as e:
-                print(f"Embedding 批量请求失败 (batch {i // max_batch_size + 1}): {e}")
+                logger.debug(f"Embedding 批量请求失败 (batch {i // max_batch_size + 1}): {e}")
                 all_embeddings.extend([None] * len(batch))
 
         return all_embeddings
@@ -116,7 +119,7 @@ def rerank_similarity(
     api_key = os.getenv("DASHSCOPE_API_KEY")
 
     if not api_key:
-        print("错误: 缺少 DASHSCOPE_API_KEY 环境变量")
+        logger.debug("错误: 缺少 DASHSCOPE_API_KEY 环境变量")
         return np.array([]), None
 
     top_n = top_n or len(texts)
