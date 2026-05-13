@@ -3,6 +3,9 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
+# Add app/ to Python path so relative imports work
+ENV PYTHONPATH=/app/app
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
