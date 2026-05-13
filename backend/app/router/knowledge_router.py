@@ -2,6 +2,7 @@
 # 未经授权，禁止转售或仿制。
 
 """知识库管理路由"""
+import logging
 import os
 import shutil
 from typing import List
@@ -9,14 +10,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
+
 from core.database import get_db
 from models.knowledge import KnowledgeBase, Document
 from models.user import User
 from router.auth_router import get_current_user_required
 from schemas.knowledge import (
-import logging
-
-logger = logging.getLogger(__name__)
     KnowledgeBaseCreate,
     KnowledgeBaseUpdate,
     KnowledgeBaseResponse,
