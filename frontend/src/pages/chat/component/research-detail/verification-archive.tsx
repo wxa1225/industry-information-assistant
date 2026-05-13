@@ -126,9 +126,9 @@ export default function VerificationArchive({ report }: VerificationArchiveProps
                   </span>
                   <span className={styles['va-conflict-resolved']}>
                     {(conflict as any).resolved ? (
-                      <CheckCircleOutlined style={{ color: '#52c41a' }} /> 已解决
+                      <><CheckCircleOutlined style={{ color: '#52c41a' }} /><span>已解决</span></>
                     ) : (
-                      <CloseCircleOutlined style={{ color: '#ff4d4f' }} /> 未解决
+                      <><CloseCircleOutlined style={{ color: '#ff4d4f' }} /><span>未解决</span></>
                     )}
                   </span>
                 </div>
