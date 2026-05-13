@@ -33,7 +33,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # Run the application with gunicorn for proper process management
 # Use --preload to load the app before forking workers
-CMD ["gunicorn", "app.app_main:app", \
+CMD ["gunicorn", "app_main:app", \
      "--bind", "0.0.0.0:8000", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", \
