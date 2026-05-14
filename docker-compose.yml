@@ -21,8 +21,6 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-industry_assistant}
       - REDIS_HOST=bupt324_redis
       - REDIS_PORT=6379
-      - MILVUS_HOST=bupt324_milvus
-      - MILVUS_PORT=19530
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8080}
       - AUTO_MIGRATE=false
@@ -54,9 +52,9 @@ services:
     networks:
       - bupt324_network
 
-  # ==================== PostgreSQL 数据库 ====================
+  # ==================== PostgreSQL 数据库 (含 pgvector 扩展) ====================
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15
     container_name: bupt324_postgres
     restart: unless-stopped
     environment:
@@ -90,35 +88,15 @@ services:
     networks:
       - bupt324_network
 
-  # ==================== Milvus 向量数据库 ====================
-  # v2.4.16 开始支持 ARM64 (aarch64) 架构
-  milvus:
-    image: milvusdb/milvus:v2.4.16
-    container_name: bupt324_milvus
+  # ==================== Cloudflare Tunnel (临时公网入口) ====================
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: bupt324_cloudflared
     restart: unless-stopped
-    security_opt:
-      - seccomp:unconfined
-    environment:
-      ETCD_USE_EMBED: true
-      ETCD_DATA_DIR: /var/lib/milvus/etcd
-      MINIO_USE_EMBED: true
-      MINIO_DATA_DIR: /var/lib/milvus/minio
-    volumes:
-      - bupt324_milvus_data:/var/lib/milvus
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    command: ["milvus", "run", "standalone"]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-      start_period: 90s
+    command: tunnel --url http://frontend:80
     networks:
       - bupt324_network
 
-  # ==================== 前端 (React + Nginx) ====================
   # 注意：端口用 8080，因为 3000 已被别人的 Open WebUI 占用
   frontend:
     build:
@@ -136,7 +114,6 @@ services:
 volumes:
   bupt324_postgres_data:
   bupt324_redis_data:
-  bupt324_milvus_data:
 
 networks:
   bupt324_network:
